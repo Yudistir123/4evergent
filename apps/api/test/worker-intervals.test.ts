@@ -1,5 +1,5 @@
 // Worker interval env vars: RECONCILIATION_INTERVAL_MS,
-// EXECUTION_QUEUE_INTERVAL_MS, SCHEDULER_INTERVAL_MS.
+// RECONCILIATION_MAX_AGE_MS, EXECUTION_QUEUE_INTERVAL_MS, SCHEDULER_INTERVAL_MS.
 //
 // Offline and deterministic: no network, no secrets. The server is started on
 // loopback with mock signer, and the worker startup log lines are captured.
@@ -44,8 +44,8 @@ test("non-numeric and non-positive values throw a clear error naming the variabl
   }
 });
 
-test("each of the three variables is validated", () => {
-  for (const name of ["RECONCILIATION_INTERVAL_MS", "EXECUTION_QUEUE_INTERVAL_MS", "SCHEDULER_INTERVAL_MS"]) {
+test("each of the four variables is validated", () => {
+  for (const name of ["RECONCILIATION_INTERVAL_MS", "RECONCILIATION_MAX_AGE_MS", "EXECUTION_QUEUE_INTERVAL_MS", "SCHEDULER_INTERVAL_MS"]) {
     assert.throws(() => readWorkerIntervals({ [name]: "abc" }), new RegExp(name));
   }
 });
@@ -54,13 +54,15 @@ test("readWorkerIntervals maps each variable to its worker", () => {
   assert.deepEqual(
     readWorkerIntervals({
       RECONCILIATION_INTERVAL_MS: "1111",
+      RECONCILIATION_MAX_AGE_MS: "4444",
       EXECUTION_QUEUE_INTERVAL_MS: "2222",
       SCHEDULER_INTERVAL_MS: "3333",
     }),
-    { reconciliationIntervalMs: 1111, executionQueueIntervalMs: 2222, schedulerIntervalMs: 3333 }
+    { reconciliationIntervalMs: 1111, reconciliationMaxAgeMs: 4444, executionQueueIntervalMs: 2222, schedulerIntervalMs: 3333 }
   );
   assert.deepEqual(readWorkerIntervals({}), {
     reconciliationIntervalMs: undefined,
+    reconciliationMaxAgeMs: undefined,
     executionQueueIntervalMs: undefined,
     schedulerIntervalMs: undefined,
   });
@@ -69,6 +71,7 @@ test("readWorkerIntervals maps each variable to its worker", () => {
 test("env-provided intervals reach the workers (asserted via startup log lines)", async () => {
   const intervals = readWorkerIntervals({
     RECONCILIATION_INTERVAL_MS: "123456",
+    RECONCILIATION_MAX_AGE_MS: "456789",
     EXECUTION_QUEUE_INTERVAL_MS: "234567",
     SCHEDULER_INTERVAL_MS: "345678",
   });
@@ -86,7 +89,7 @@ test("env-provided intervals reach the workers (asserted via startup log lines)"
       horizonUrl: "https://horizon-testnet.stellar.org",
       signer: new MockSigner(),
       authProvider: new DevAuthProvider({ defaultOwnerId: "test" }),
-      reconciliation: { enabled: true, intervalMs: intervals.reconciliationIntervalMs },
+      reconciliation: { enabled: true, intervalMs: intervals.reconciliationIntervalMs, maxAgeMs: intervals.reconciliationMaxAgeMs },
       executionQueue: { enabled: true, intervalMs: intervals.executionQueueIntervalMs },
       scheduler: { enabled: true, intervalMs: intervals.schedulerIntervalMs },
     });
@@ -96,6 +99,7 @@ test("env-provided intervals reach the workers (asserted via startup log lines)"
   }
 
   assert.ok(lines.includes("[reconciler] started, interval: 123456 ms"), lines.join("\n"));
+  assert.ok(lines.includes("[reconciler] not_found max age: 456789 ms"), lines.join("\n"));
   assert.ok(lines.includes("[execution-queue] started, interval: 234567 ms"), lines.join("\n"));
   assert.ok(lines.includes("[scheduler] started, interval: 345678 ms"), lines.join("\n"));
 });

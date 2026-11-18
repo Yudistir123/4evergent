@@ -18,7 +18,7 @@ import { ScheduleExecutionService } from "./schedule-execution.js";
 import { ExecutionQueue } from "./execution-queue.js";
 import { ExecutionRecoveryService } from "./execution-recovery.js";
 import { ScheduleRecoveryService } from "./schedule-recovery.js";
-import { TransactionStatusReconciler } from "@4evergent/stellar";
+import { TransactionStatusReconciler, DEFAULT_SUBMITTED_MAX_AGE_MS } from "@4evergent/stellar";
 import { AccountSequenceCoordinator } from "./account-sequence-coordinator.js";
 import type { ExecutionRecord, ExecutionStatus } from "@4evergent/database";
 import type { ScheduleExecutionResult } from "./schedule-execution.js";
@@ -164,6 +164,8 @@ export interface ServerOptions {
   reconciliation?: {
     enabled?: boolean;
     intervalMs?: number;
+    /** Max age of a `submitted` execution still `not_found` before it is retired to `failed`. */
+    maxAgeMs?: number;
     instance?: import("@4evergent/stellar").TransactionStatusReconciler;
   };
 }
@@ -442,9 +444,14 @@ export async function createApiServer(options: ServerOptions) {
       options.reconciliation.instance ??
       new TransactionStatusReconciler(executionStore, statusProvider, {
         intervalMs: options.reconciliation.intervalMs,
+        maxAgeMs: options.reconciliation.maxAgeMs,
+        // #276: release the daily-spending reservation of a retired
+        // execution, when the record proves one was made (#353).
+        activityStore: store,
       });
     reconciler.start();
     console.log("[reconciler] started, interval:", options.reconciliation.intervalMs ?? 30_000, "ms");
+    console.log("[reconciler] not_found max age:", options.reconciliation.maxAgeMs ?? DEFAULT_SUBMITTED_MAX_AGE_MS, "ms");
   }
 
   if (options.executionQueue?.enabled) {

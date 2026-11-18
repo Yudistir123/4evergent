@@ -92,6 +92,7 @@ export function parseShutdownTimeout(value: string | undefined, fallback = 10_00
 
 export interface WorkerIntervals {
   reconciliationIntervalMs: number | undefined;
+  reconciliationMaxAgeMs: number | undefined;
   executionQueueIntervalMs: number | undefined;
   schedulerIntervalMs: number | undefined;
 }
@@ -100,6 +101,7 @@ export interface WorkerIntervals {
 export function readWorkerIntervals(env: NodeJS.ProcessEnv): WorkerIntervals {
   return {
     reconciliationIntervalMs: parseIntervalEnv("RECONCILIATION_INTERVAL_MS", env.RECONCILIATION_INTERVAL_MS),
+    reconciliationMaxAgeMs: parseIntervalEnv("RECONCILIATION_MAX_AGE_MS", env.RECONCILIATION_MAX_AGE_MS),
     executionQueueIntervalMs: parseIntervalEnv("EXECUTION_QUEUE_INTERVAL_MS", env.EXECUTION_QUEUE_INTERVAL_MS),
     schedulerIntervalMs: parseIntervalEnv("SCHEDULER_INTERVAL_MS", env.SCHEDULER_INTERVAL_MS),
   };
@@ -392,7 +394,7 @@ async function main() {
         dailySpendingDays: parseRetentionDays(process.env.DAILY_SPENDING_RETENTION_DAYS, 90),
       },
       executionQueue: { enabled: true, intervalMs: workerIntervals.executionQueueIntervalMs },
-      reconciliation: { enabled: true, intervalMs: workerIntervals.reconciliationIntervalMs },
+      reconciliation: { enabled: true, intervalMs: workerIntervals.reconciliationIntervalMs, maxAgeMs: workerIntervals.reconciliationMaxAgeMs },
       authProvider,
       authModule,
       corsOrigin: webOrigin,
