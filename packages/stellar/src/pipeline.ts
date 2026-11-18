@@ -33,6 +33,27 @@ export interface PipelineExecuteInput {
   activityId?: string;
   signal?: AbortSignal;
   onBeforeSubmit?: () => void | Promise<void>;
+  /**
+   * Policy decision already obtained by the caller (#353). When provided,
+   * the pipeline MUST NOT re-evaluate policy: the caller's evaluation
+   * already reserved daily spending exactly once, and a second evaluation
+   * would reserve a second time. Callers without a decision (schedule,
+   * execution queue) omit it and the pipeline evaluates once itself.
+   */
+  policyDecision?: PolicyDecision;
+}
+
+/**
+ * Options for `executeApproved` (issue #275).
+ *
+ * The queue path dispatches approved records here instead of `execute()`,
+ * so it needs the same abort/cancellation parity `execute()` has: an
+ * AbortSignal that throws AbortError, and an `onBeforeSubmit` hook invoked
+ * (with abort re-checked) immediately before submission.
+ */
+export interface ExecuteApprovedOptions {
+  signal?: AbortSignal;
+  onBeforeSubmit?: () => void | Promise<void>;
 }
 
 export class TransactionPipeline {
@@ -85,10 +106,16 @@ export class TransactionPipeline {
 
     const agentId = (sourceAccount as any)?.agentId ?? (sourceAccount as any)?.accountId?.() ?? "unknown";
     const ownerId = (sourceAccount as any)?.ownerId ?? "unknown";
-    // Resolve policy at execution time — uses policyResolver if provided
-    const decision = await this.policy.evaluate(intent, agentId);
+    // #353: single evaluation per submission. A caller-supplied decision is
+    // used as-is (its evaluation already reserved once); otherwise evaluate
+    // once here. Never both.
+    const decision = input.policyDecision ?? await this.policy.evaluate(intent, agentId);
 
     if (decision.result === "deny") {
+      // Post-#353 the engine reserves only after every deny check, so a
+      // deny normally carries no reservation. Release defensively anyway:
+      // a no-op when reservedDailySpending is absent.
+      await this.releaseReservation(agentId, decision);
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "rejected";
       activity.authorizationStatus = "denied_by_policy";
@@ -144,6 +171,9 @@ export class TransactionPipeline {
       if (signal?.aborted || e?.name === "AbortError") {
         throw e;
       }
+      // #353: construction failed — the intent will never execute, release
+      // its daily-spending reservation.
+      await this.releaseReservation(agentId, decision);
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "rejected";
       activity.error = e.message;
@@ -161,6 +191,9 @@ export class TransactionPipeline {
 
     const simResult = await this.simulator.simulate(tx);
     if (!simResult.success) {
+      // #353: simulation failed — the intent will never execute, release
+      // its daily-spending reservation.
+      await this.releaseReservation(agentId, decision);
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "failed";
       activity.authorizationStatus = "denied_by_simulation";
@@ -184,6 +217,9 @@ export class TransactionPipeline {
       if (signal?.aborted || e?.name === "AbortError") {
         throw e;
       }
+      // #353: signing failed — the intent will never execute, release its
+      // daily-spending reservation.
+      await this.releaseReservation(agentId, decision);
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "failed";
       activity.error = e.message;
@@ -227,6 +263,9 @@ export class TransactionPipeline {
       if (signal?.aborted || e?.name === "AbortError") {
         throw e;
       }
+      // #353: submission failed — the intent did not execute, release its
+      // daily-spending reservation.
+      await this.releaseReservation(agentId, decision);
       // Submit failed — record pre-submit hash + error for recovery/reconciliation
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "failed";
@@ -252,7 +291,23 @@ export class TransactionPipeline {
    * the agent's CURRENT policy at execution time. If policy was tightened between
    * approval and execution, the execution is denied.
    */
-  async executeApproved(approvalId: string, approver?: string): Promise<PipelineOutcome> {
+  async executeApproved(
+    approvalId: string,
+    approver?: string,
+    options?: ExecuteApprovedOptions
+  ): Promise<PipelineOutcome> {
+    // Abort parity with execute(): cancellation throws AbortError instead
+    // of returning a rejection, so the queue treats it as a cancel, not a
+    // failure to retry (#275).
+    const checkAbort = () => {
+      if (options?.signal?.aborted) {
+        const err = new Error("Execution was cancelled");
+        err.name = "AbortError";
+        throw err;
+      }
+    };
+    checkAbort();
+
     if (!this.approvalStore || !this.activityStore) {
       return {
         status: "rejected",
@@ -293,6 +348,9 @@ export class TransactionPipeline {
 
     if (approval.expiresAt && new Date(approval.expiresAt) < new Date()) {
       await this.approvalStore.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
+      // #353: expired approval will never execute — release the reservation
+      // made when the intent was created.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "rejected",
         message: "Approval has expired",
@@ -306,9 +364,13 @@ export class TransactionPipeline {
     // the intent must be denied.
     // skipReservation: daily spending was already reserved at intent-creation time.
     // Re-evaluating here must NOT double-reserve.
+    checkAbort();
     const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true });
     if (currentDecision.result === "deny") {
       await this.approvalStore.update(approvalId, { status: "failed", error: `Policy re-evaluation denied: ${currentDecision.reason}` });
+      // #353: tightened policy denies execution — the intent will never
+      // execute, release the reservation made at creation time.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "rejected",
         message: `Policy re-evaluation denied: ${currentDecision.reason}`,
@@ -320,6 +382,7 @@ export class TransactionPipeline {
 
     await this.approvalStore.update(approvalId, { status: "executing" });
 
+    checkAbort();
     const intent = approval.intent;
     const adapter = new StellarAdapter(this.horizonUrl);
 
@@ -334,6 +397,8 @@ export class TransactionPipeline {
       };
     } catch (e: any) {
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
+      // #353: source account unloadable — execution cannot proceed, release.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "rejected",
         message: `Cannot load source account: ${e.message}`,
@@ -351,7 +416,12 @@ export class TransactionPipeline {
         tx = await this.builder.buildPayment(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
       }
     } catch (e: any) {
+      if (options?.signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
+      // #353: construction failed — release the creation-time reservation.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "rejected",
         message: `Construction failed: ${e.message}`,
@@ -361,9 +431,12 @@ export class TransactionPipeline {
       };
     }
 
+    checkAbort();
     const simResult = await this.simulator.simulate(tx);
     if (!simResult.success) {
       await this.approvalStore.update(approvalId, { status: "failed", error: simResult.error ?? "Simulation failed" });
+      // #353: simulation failed — release the creation-time reservation.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "simulation_failed",
         message: simResult.error ?? "Simulation failed",
@@ -373,11 +446,17 @@ export class TransactionPipeline {
       };
     }
 
+    checkAbort();
     let signedTx;
     try {
       signedTx = await this.signer.sign(tx);
     } catch (e: any) {
+      if (options?.signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
+      // #353: signing failed — release the creation-time reservation.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "rejected",
         message: `Signing failed: ${e.message}`,
@@ -387,12 +466,25 @@ export class TransactionPipeline {
       };
     }
 
+    // Mirror execute(): run the onBeforeSubmit hook, then re-check abort,
+    // immediately before submission.
+    await options?.onBeforeSubmit?.();
+    checkAbort();
+
     // PERSIST txHash BEFORE submit to survive crash window
     const preSubmitHash = signedTx.hash().toString("hex");
 
     try {
       const result = await this.submitter.submit(signedTx, this.signer.getNetworkPassphrase());
-      await this.approvalStore.update(approvalId, { status: "submitted", txHash: result.hash, approvedAt: new Date().toISOString(), approver: approver ?? null });
+      // Only overwrite the approver when one was explicitly passed (the
+      // queue path has none — the approver recorded at approve time must
+      // survive). Previously `approver ?? null` wiped it.
+      await this.approvalStore.update(approvalId, {
+        status: "submitted",
+        txHash: result.hash,
+        approvedAt: new Date().toISOString(),
+        ...(approver !== undefined ? { approver } : {}),
+      });
       if (approval.activityId) {
         const existing = await this.activityStore.get(approval.activityId);
         if (existing) {
@@ -405,10 +497,16 @@ export class TransactionPipeline {
         policyDecision: currentDecision,
         simulationResult: simResult,
         txHash: result.hash,
+        submittedHash: result.hash,
         activityId: approval.activityId,
       };
     } catch (e: any) {
+      if (options?.signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
+      // #353: submission failed — release the creation-time reservation.
+      await this.releaseApprovalReservation(approval);
       return {
         status: "rejected",
         message: `Submission failed: ${e.message}`,
@@ -418,6 +516,34 @@ export class TransactionPipeline {
         activityId: approval.activityId,
       };
     }
+  }
+
+  /**
+   * Release the daily-spending reservation recorded on a decision (#353).
+   * No-op when the decision reserved nothing (deny, skipReservation
+   * re-check, pre-#353 decision) or the store cannot release. A release
+   * failure is swallowed: the outcome being reported must not be masked
+   * by a bookkeeping error; the stale row is swept at the day boundary.
+   * Abort paths deliberately do NOT call this: an aborted execution is in
+   * an unknown state (the transaction may have landed), so the reservation
+   * is conservatively kept.
+   */
+  private async releaseReservation(agentId: string, decision: PolicyDecision | null | undefined): Promise<void> {
+    const reserved = decision?.reservedDailySpending;
+    if (!reserved || !this.activityStore?.releaseDailySpending) return;
+    try {
+      await this.activityStore.releaseDailySpending(agentId, reserved.asset, reserved.amount);
+    } catch {
+      // Best-effort bookkeeping — see above.
+    }
+  }
+
+  /** Release the reservation made when the approval's intent was created. */
+  private async releaseApprovalReservation(approval: {
+    agentId: string;
+    policyDecision: PolicyDecision;
+  }): Promise<void> {
+    await this.releaseReservation(approval.agentId, approval.policyDecision);
   }
 
   private async persistActivity(

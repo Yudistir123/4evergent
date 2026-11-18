@@ -113,6 +113,18 @@ export interface PolicyDecision {
   reason: string;
   rule: string;
   intent: AgentIntent;
+  /**
+   * Daily-spending reservation made by this evaluation (#353).
+   *
+   * Present ONLY when evaluate() atomically reserved `amount` of `asset`
+   * for the agent/day. Whoever owns the intent after this decision MUST
+   * release it via ActivityStore.releaseDailySpending if the intent never
+   * executes (approval rejected/expired, execution failure). Decisions
+   * produced without a reservation — denies, skipReservation re-checks,
+   * and decisions created before this field existed — carry no proof of a
+   * reservation, so release is skipped for them rather than guessed.
+   */
+  reservedDailySpending?: { asset: string; amount: string };
 }
 
 export type ActivityStatus =

@@ -138,8 +138,16 @@ test("TRUSTLINE: policy deny prevents signing", async () => {
 });
 
 test("TRUSTLINE: approval-required trustline does not sign before approval", async () => {
+  // #353: the asset allowlist is checked before the approval threshold, so
+  // the trustline asset must be allowlisted for this scenario to reach
+  // requires_approval. A non-allowlisted asset is denied outright (it must
+  // not be approvable past the allowlist).
   const { pipeline, signer, approval } = makePipeline({
-    rules: { requireHumanApprovalForAmountAbove: "0", maxTxAmount: { native: "1000000" } },
+    rules: {
+      requireHumanApprovalForAmountAbove: "0",
+      maxTxAmount: { native: "1000000" },
+      allowedAssets: ["trustline:USDC:GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U"],
+    },
   });
   const intent: AgentIntent = {
     type: "trustline",

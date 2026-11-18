@@ -9,7 +9,7 @@ import type {
 } from "@4evergent/shared";
 import { API_ERRORS, type ApiErrorCode } from "./error-codes.js";
 import { IntentValidator } from "@4evergent/agent-core";
-import { PolicyEngine, DEFAULT_RULES, validatePolicyRules, normalizePolicyRules } from "@4evergent/policy";
+import { PolicyEngine, DEFAULT_RULES, validatePolicyRules, normalizePolicyRules, parseStrictAmount } from "@4evergent/policy";
 import { StellarAdapter } from "@4evergent/agent-core";
 import { TransactionPipeline } from "@4evergent/stellar";
 import type { Signer } from "@4evergent/stellar";
@@ -248,6 +248,22 @@ export async function createApiServer(options: ServerOptions) {
 
   // Phase 28J: PolicyEngine in API uses the SAME resolver
   const policy = new PolicyEngine(options.policyRules, store as any, getRules);
+
+  /**
+   * Release the daily-spending reservation recorded on a policy decision
+   * (#353). No-op when the decision reserved nothing. Used by handlers for
+   * the paths the pipeline never runs (source-account load failure,
+   * approval reject/expiry), where the pipeline's own release cannot fire.
+   */
+  async function releaseDecisionReservation(agentId: string, decision: PolicyDecision | null | undefined): Promise<void> {
+    const reserved = decision?.reservedDailySpending;
+    if (!reserved) return;
+    try {
+      await store.releaseDailySpending(agentId, reserved.asset, reserved.amount);
+    } catch {
+      // Best-effort bookkeeping; the stale row is swept at the day boundary.
+    }
+  }
   const adapter = new StellarAdapter(options.horizonUrl);
 
   const readinessTimeoutMs = options.readiness?.timeoutMs ?? 2_000;
@@ -430,21 +446,37 @@ export async function createApiServer(options: ServerOptions) {
           throw err;
         }
         try {
-          const sourceAccount = await getSourceAccount();
-          if (context?.signal?.aborted) {
-            const err = new Error("Execution was cancelled");
-            err.name = "AbortError";
-            throw err;
+          // #275: records carrying an approvalId must go through
+          // executeApproved(), not execute(). execute() re-evaluates policy,
+          // sees requires_approval again, and creates a DUPLICATE approval —
+          // so an approved intent could never be submitted on the default
+          // queue path. Records without an approvalId (scheduler, manual)
+          // keep using execute().
+          let outcome: Awaited<ReturnType<typeof pipeline.executeApproved>>;
+          if (record.approvalId) {
+            outcome = await pipeline.executeApproved(record.approvalId, undefined, {
+              signal: context?.signal,
+              onBeforeSubmit: () => {
+                context?.onBeforeSubmit?.();
+              },
+            });
+          } else {
+            const sourceAccount = await getSourceAccount();
+            if (context?.signal?.aborted) {
+              const err = new Error("Execution was cancelled");
+              err.name = "AbortError";
+              throw err;
+            }
+            outcome = await pipeline.execute({
+              intent: record.intent,
+              sourceAccount,
+              activityId: record.activityId ?? undefined,
+              signal: context?.signal,
+              onBeforeSubmit: () => {
+                context?.onBeforeSubmit?.();
+              },
+            });
           }
-          const outcome = await pipeline.execute({
-            intent: record.intent,
-            sourceAccount,
-            activityId: record.activityId ?? undefined,
-            signal: context?.signal,
-            onBeforeSubmit: () => {
-              context?.onBeforeSubmit?.();
-            },
-          });
           const txHash = (outcome as { txHash?: string }).txHash;
           if (txHash) {
             context?.onSubmitted?.(txHash);
@@ -1610,13 +1642,13 @@ export async function createApiServer(options: ServerOptions) {
     const decision = await policy.evaluate(intent, agentId);
 
     if (decision.result === "deny") {
-      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey });
+      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey, policyDecision: decision });
       const denied = outcome.activityId ? await store.get(outcome.activityId) : null;
       return json(res, toIntentResponse(denied!), 403);
     }
 
     if (decision.result === "requires_approval") {
-      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey });
+      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey, policyDecision: decision });
       if (outcome.status === "requires_approval" && outcome.activityId) {
         const pending = await store.get(outcome.activityId);
         assertNoSecrets(pending!);
@@ -1650,10 +1682,15 @@ export async function createApiServer(options: ServerOptions) {
           ownerId: ctx.ownerId!,
         };
       } catch (e) {
+        // #353: the pipeline never ran, so it cannot release the reservation
+        // made by policy.evaluate() above — release it here before throwing.
+        await releaseDecisionReservation(agentId, decision);
         throw new Error(`Unable to load source account: ${(e as Error).message}`);
       }
 
-      return pipeline.execute({ intent, sourceAccount, idempotencyKey });
+      // #353: pass the handler's decision — the pipeline must NOT
+      // re-evaluate (that would reserve daily spending a second time).
+      return pipeline.execute({ intent, sourceAccount, idempotencyKey, policyDecision: decision });
     }).catch((e: any) => {
       return { status: "failed", message: e?.message ?? "Unknown error" } as any;
     });
@@ -1730,6 +1767,9 @@ export async function createApiServer(options: ServerOptions) {
 
     if (approval.expiresAt && new Date(approval.expiresAt) < new Date()) {
       await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
+      // #353: expired approval will never execute — release the reservation
+      // made when the intent was created.
+      await releaseDecisionReservation(approval.agentId, approval.policyDecision);
       return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
     }
 
@@ -1809,6 +1849,9 @@ export async function createApiServer(options: ServerOptions) {
 
     await approvals.update(approvalId, { status: "rejected", rejectedAt: new Date().toISOString() });
     await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_policy", error: "approval rejected by human" });
+    // #353: rejected approval will never execute — release the reservation
+    // made when the intent was created.
+    await releaseDecisionReservation(approval.agentId, approval.policyDecision);
 
     return json(res, toApprovalResponse(approvalId, approval.activityId, "rejected", "approval rejected"), 200);
   }
@@ -2051,6 +2094,12 @@ function parseIntent(body: unknown): AgentIntent {
       if (typeof b.asset !== "string") throw new Error("payment.asset is required");
       if (typeof b.destination !== "string") throw new Error("payment.destination is required");
       if (typeof b.amount !== "string") throw new Error("payment.amount is required as string");
+      // Strict amount (#264): parseFloat would read 10 out of "10abc" and
+      // 100 out of "1e2". Reject anything that is not a canonical Stellar
+      // decimal (digits, optional "." + 1–7 fractional digits).
+      if (parseStrictAmount(b.amount) === null) {
+        throw new Error("payment.amount must be a valid Stellar amount (digits with up to 7 decimal places)");
+      }
       if (typeof b.reason !== "string") throw new Error("payment.reason is required");
       let validatedDetails: { code: string; issuer: string | null } | undefined;
       const assetDetails = (b.assetDetails as { code?: unknown; issuer?: unknown } | undefined);
@@ -2087,6 +2136,9 @@ function parseIntent(body: unknown): AgentIntent {
       if (b.assetCode === "XLM") throw new Error("XLM cannot be used as a trustline asset");
       if (typeof b.issuer !== "string" || !b.issuer.startsWith("G") || b.issuer.length !== 56) {
         throw new Error("trustline.issuer must be a valid Stellar address (G...)");
+      }
+      if (typeof b.limit === "string" && b.limit.trim().length > 0 && parseStrictAmount(b.limit) === null) {
+        throw new Error("trustline.limit must be a valid Stellar amount (digits with up to 7 decimal places)");
       }
       if (typeof b.reason !== "string") throw new Error("trustline.reason is required");
       return {

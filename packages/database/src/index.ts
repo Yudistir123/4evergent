@@ -29,6 +29,14 @@ export interface ActivityStore {
   recordIdempotent(key: string, record: ActivityRecord): Promise<{ record: ActivityRecord; created: boolean }>;
   /** Atomically reserve daily spending. Returns true if reservation succeeded, false if limit would be exceeded. */
   reserveDailySpending(agentId: string, asset: string, amount: string, limit: string, now?: Date): Promise<boolean>;
+  /**
+   * Release a previously reserved amount (#353). Decrements the day's total
+   * for (agentId, asset) by `amount`, floored at 0; a no-op when nothing was
+   * reserved. Callers MUST only release amounts proven reserved (see
+   * PolicyDecision.reservedDailySpending) — releasing an unreserved amount
+   * would free another intent's reservation.
+   */
+  releaseDailySpending(agentId: string, asset: string, amount: string, now?: Date): Promise<void>;
   /** Get current day's total spent for an agent. */
   getDailySpending(agentId: string, asset: string, now?: Date): Promise<number | null>;
   /** Remove at most `limit` rows with a UTC day earlier than cutoffDay. */
@@ -210,6 +218,31 @@ export class InMemoryActivityStore implements ActivityStore {
       .toISOString().slice(0, 10);
     const mapKey = `${agentId}:${asset}:${day}`;
     return this.dailySpending.get(mapKey) ?? null;
+  }
+
+  async releaseDailySpending(agentId: string, asset: string, amount: string, now = new Date()): Promise<void> {
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum <= 0) return;
+
+    const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+      .toISOString()
+      .slice(0, 10);
+
+    const mapKey = `${agentId}:${asset}:${day}`;
+
+    // Serialize through the same promise chain as reserveDailySpending so a
+    // release cannot interleave with a concurrent reserve check+commit.
+    // Floored at 0: releasing more than reserved (caller bug / stale
+    // decision) must never drive the total negative or free another
+    // intent's reservation beyond zeroing this key.
+    const result = this.dailySpendingLock.then(() => {
+      const current = this.dailySpending.get(mapKey) ?? 0;
+      const next = current - amountNum;
+      if (next <= 0) this.dailySpending.delete(mapKey);
+      else this.dailySpending.set(mapKey, next);
+    });
+    this.dailySpendingLock = result.catch(() => undefined);
+    return result;
   }
 
   async sweepDailySpending(cutoffDay: string, limit = 500): Promise<number> {
