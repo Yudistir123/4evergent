@@ -3,6 +3,7 @@ import type { AgentIntent } from "@4evergent/shared";
 import type { ScheduleStore, ScheduleRecord } from "./schedule-types.js";
 import { getSharedConnection, closeSharedConnection } from "./shared-connection.js";
 import { clampOffset, clampLimit } from "./pagination.js";
+import { ensureColumn, MigrationError } from "./migration.js";
 
 /**
  * InMemoryScheduleStore — process-local schedule log.
@@ -132,7 +133,10 @@ export class SQLiteScheduleStore implements ScheduleStore {
   }
 
   private initSchema(): void {
-    this.db.exec(`
+    // #401: any failure creating the base schema must also fail loudly
+    // with the table named, never silently start on a broken database.
+    try {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);
 
       CREATE TABLE IF NOT EXISTS schedules (
@@ -154,14 +158,21 @@ export class SQLiteScheduleStore implements ScheduleStore {
       CREATE INDEX IF NOT EXISTS idx_schedules_owner ON schedules(owner_id);
       CREATE INDEX IF NOT EXISTS idx_schedules_status ON schedules(status);
       CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run_at);
+    `);
+    } catch (err) {
+      throw new MigrationError("schedules", null, err);
+    }
+
+    // #401: this used to be a bare try/catch that swallowed every failure
+    // as "column already exists". See execution-store.ts for the same fix.
+    ensureColumn(this.db, "schedules", "last_started_at", "TEXT");
+
+    // The index on last_started_at must be created AFTER the column exists:
+    // on a legacy table without the column, creating it first fails with
+    // "no such column" — which is exactly the migration this runs.
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_schedules_last_started ON schedules(last_started_at);
     `);
-
-    try {
-      this.db.exec("ALTER TABLE schedules ADD COLUMN last_started_at TEXT");
-    } catch {
-      // Column already exists or table was created with the column
-    }
   }
 
   async create(record: ScheduleRecord): Promise<ScheduleRecord> {

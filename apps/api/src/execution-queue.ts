@@ -218,10 +218,18 @@ export class ExecutionQueue {
     }
 
     const now = new Date().toISOString();
+    // #378: a re-queued record is a FRESH attempt — the previous attempt's
+    // hashes must not travel with it, or listDue would treat a later
+    // queue-failure as a terminal on-chain outcome (failed + submittedHash
+    // is never picked up) and the operator's retry could never auto-retry.
+    // The pre-check above already ran against the old hash, so clearing
+    // here does not weaken its guard.
     const updated = await this.store.updateIfStatus(id, existing.status, {
       status: "queued",
       nextRetryAt: null,
       error: null,
+      txHash: null,
+      submittedHash: null,
       startedAt: null,
       updatedAt: now,
     });
@@ -376,6 +384,12 @@ export class ExecutionQueue {
       txHash: result.txHash ?? null,
       submittedHash: result.submittedHash ?? record.submittedHash ?? null,
       error: null,
+      // #378: a successful submission clears the stale retry schedule (and
+      // the previous attempt's error classification). Without this, a
+      // record that later fails on-chain keeps an already-past nextRetryAt
+      // and the queue would re-execute the terminal outcome.
+      nextRetryAt: null,
+      errorClass: null,
       completedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -414,12 +428,24 @@ export class ExecutionQueue {
     } as Partial<ExecutionRecord>);
 
     // Decide whether to retry or move to dead_letter
-    // Use pre-check enhanced decision if preCheck is available and submittedHash exists
+    // Use pre-check enhanced decision if preCheck is available and a hash
+    // exists for the CURRENT attempt (see below).
     let shouldRetry = false;
     let nextRetryAt: string | null = null;
 
-    if (this.preCheck && record.submittedHash) {
-      const decision = await this.evaluateRetryWithPreCheck(record, attempt, classification);
+    // #378: the pre-check must consult the CURRENT attempt's hash — the
+    // outcome's submittedHash (carried in extraUpdate by complete()) — not
+    // record.submittedHash, which is the pre-execution snapshot. Consulting
+    // the old hash could dead-letter a new attempt that never submitted
+    // anything, just because the previous attempt's transaction was found
+    // on-chain. When there is no outcome hash (uncaught-error path), the
+    // snapshot is the only hash available and is used as before.
+    const currentHash =
+      typeof extraUpdate?.submittedHash === "string"
+        ? (extraUpdate.submittedHash as string)
+        : (record.submittedHash ?? null);
+    if (this.preCheck && currentHash) {
+      const decision = await this.evaluateRetryWithPreCheck(record, attempt, classification, currentHash);
       shouldRetry = decision.shouldRetry;
       nextRetryAt = decision.nextRetryAt;
     } else {
@@ -448,21 +474,25 @@ export class ExecutionQueue {
    * - submittedHash found on-chain → NO retry (transaction exists)
    * - network_error / ambiguous → NO blind retry (preserve state)
    * - definitive not_found → retry only if existing policy allows
+   *
+   * @param submittedHash — the CURRENT attempt's hash (from the pipeline
+   * outcome), never the pre-execution snapshot's hash (#378).
    */
   private async evaluateRetryWithPreCheck(
     record: ExecutionRecord,
     attempt: number,
-    classification: string
+    classification: string,
+    submittedHash?: string | null
   ): Promise<{ shouldRetry: boolean; nextRetryAt: string | null }> {
-    const submittedHash = record.submittedHash;
-    if (!submittedHash || !this.preCheck) {
+    const hash = submittedHash ?? record.submittedHash;
+    if (!hash || !this.preCheck) {
       // Fall back to existing policy if no pre-check available
       return shouldRetryNow(record.id, attempt, classification, this.retryPolicy, this.nowFn);
     }
 
     let preCheckResult: PreCheckResult;
     try {
-      preCheckResult = await this.preCheck(submittedHash);
+      preCheckResult = await this.preCheck(hash);
     } catch {
       // Pre-check itself failed — treat as ambiguous, do NOT blind retry
       return { shouldRetry: false, nextRetryAt: null };

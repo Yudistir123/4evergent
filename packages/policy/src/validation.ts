@@ -1,4 +1,5 @@
 import type { PolicyRules } from "@4evergent/shared";
+import { parseStrictAmount } from "./amount.js";
 
 /**
  * Policy validation result.
@@ -43,8 +44,8 @@ export function validatePolicyRules(rules: any): PolicyValidationResult {
         if (typeof amount !== "string" && typeof amount !== "number") {
           errors.push(`maxTxAmount.${asset} must be a string or number`);
         } else {
-          const num = parseFloat(String(amount));
-          if (!isFinite(num) || num <= 0) {
+          const num = parseStrictAmount(amount);
+          if (num === null || num <= 0) {
             errors.push(`maxTxAmount.${asset} must be a positive number, got ${amount}`);
           }
         }
@@ -61,8 +62,8 @@ export function validatePolicyRules(rules: any): PolicyValidationResult {
         if (typeof limit !== "string" && typeof limit !== "number") {
           errors.push(`dailySpendingLimit.${asset} must be a string or number`);
         } else {
-          const num = parseFloat(String(limit));
-          if (!isFinite(num) || num < 0) {
+          const num = parseStrictAmount(limit);
+          if (num === null || num < 0) {
             errors.push(`dailySpendingLimit.${asset} must be a non-negative number, got ${limit}`);
           }
         }
@@ -75,8 +76,8 @@ export function validatePolicyRules(rules: any): PolicyValidationResult {
     if (typeof rules.approvalThreshold !== "string" && typeof rules.approvalThreshold !== "number") {
       errors.push("approvalThreshold must be a string or number");
     } else {
-      const num = parseFloat(String(rules.approvalThreshold));
-      if (!isFinite(num) || num < 0) {
+      const num = parseStrictAmount(rules.approvalThreshold);
+      if (num === null || num < 0) {
         errors.push(`approvalThreshold must be a non-negative number, got ${rules.approvalThreshold}`);
       }
     }
@@ -87,8 +88,8 @@ export function validatePolicyRules(rules: any): PolicyValidationResult {
     if (typeof rules.requireHumanApprovalForAmountAbove !== "string" && typeof rules.requireHumanApprovalForAmountAbove !== "number") {
       errors.push("requireHumanApprovalForAmountAbove must be a string or number");
     } else {
-      const num = parseFloat(String(rules.requireHumanApprovalForAmountAbove));
-      if (!isFinite(num) || num < 0) {
+      const num = parseStrictAmount(rules.requireHumanApprovalForAmountAbove);
+      if (num === null || num < 0) {
         errors.push(`requireHumanApprovalForAmountAbove must be a non-negative number, got ${rules.requireHumanApprovalForAmountAbove}`);
       }
     }

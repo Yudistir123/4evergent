@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { ExecutionStore, ExecutionRecord, ExecutionStatus } from "./execution-types.js";
 import { getSharedConnection } from "./shared-connection.js";
 import { clampOffset, clampLimit } from "./pagination.js";
+import { ensureColumn, MigrationError } from "./migration.js";
 
 const MAX_LIMIT = 200;
 
@@ -31,7 +32,17 @@ export class InMemoryExecutionStore implements ExecutionStore {
     return [...this.records.values()]
       .filter(
         (r) =>
-          (r.status === "queued" || r.status === "failed") &&
+          // #378: a `failed` record is only retryable when the queue itself
+          // scheduled the retry (nextRetryAt set and due) AND the current
+          // attempt never submitted on-chain (no submittedHash). A
+          // reconciler-failed record always carries a submittedHash, so the
+          // submittedHash clause is what excludes it even when it still
+          // carries a stale, already-past nextRetryAt from before the
+          // complete() fix — nextRetryAt alone cannot tell the two apart.
+          // Operator-initiated retry() moves the record back to `queued`,
+          // which this filter still picks up.
+          (r.status === "queued" ||
+            (r.status === "failed" && r.nextRetryAt && !r.submittedHash)) &&
           (!r.nextRetryAt || r.nextRetryAt <= before)
       )
       .sort((a, b) => (a.nextRetryAt ?? "").localeCompare(b.nextRetryAt ?? ""))
@@ -240,7 +251,10 @@ export class SQLiteExecutionStore implements ExecutionStore {
   }
 
   private initSchema(): void {
-    this.db.exec(`
+    // #401: any failure creating the base schema must also fail loudly
+    // with the table named, never silently start on a broken database.
+    try {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);
 
       CREATE TABLE IF NOT EXISTS executions (
@@ -270,11 +284,14 @@ export class SQLiteExecutionStore implements ExecutionStore {
       CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
       CREATE INDEX IF NOT EXISTS idx_executions_next_retry ON executions(next_retry_at);
     `);
-    try {
-      this.db.exec(`ALTER TABLE executions ADD COLUMN submitted_hash TEXT`);
-    } catch {
-      // Column already exists (new schema or previously migrated).
+    } catch (err) {
+      throw new MigrationError("executions", null, err);
     }
+    // #401: this used to be a bare try/catch that swallowed every failure
+    // (locked database, I/O error, ...) as "column already exists". The
+    // migration now checks first and throws MigrationError on any other
+    // failure, so startup aborts instead of starting half-migrated.
+    ensureColumn(this.db, "executions", "submitted_hash", "TEXT");
   }
 
   async record(record: ExecutionRecord): Promise<void> {
@@ -329,7 +346,7 @@ export class SQLiteExecutionStore implements ExecutionStore {
     const rows = this.db
       .prepare(
         `SELECT * FROM executions
-         WHERE (status = 'queued' OR status = 'failed')
+         WHERE (status = 'queued' OR (status = 'failed' AND next_retry_at IS NOT NULL AND submitted_hash IS NULL))
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
          ORDER BY next_retry_at ASC
          LIMIT ?`

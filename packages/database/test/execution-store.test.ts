@@ -213,6 +213,24 @@ for (const harness of harnesses) {
     assert.deepEqual(due, ["failed-due", "queued-now"]);
   });
 
+  test(`${harness.name}: listDue never picks up reconciler-failed records (#378)`, async () => {
+    const store = harness.create();
+    const now = "2026-01-01T00:00:10.000Z";
+    // Reconciler-failed: terminal on-chain outcome. No scheduled retry
+    // (nextRetryAt null), or a stale already-past one left over from an
+    // earlier attempt — either way the queue must never re-execute it.
+    // Both variants carry the on-chain submission hash.
+    await store.record(makeRecord({ id: "reconciler-failed-null", status: "failed", submittedHash: "onchain-hash", txHash: "onchain-hash", error: "Transaction failed on-chain", nextRetryAt: null }));
+    await store.record(makeRecord({ id: "reconciler-failed-stale", status: "failed", submittedHash: "onchain-hash", txHash: "onchain-hash", error: "Transaction failed on-chain", nextRetryAt: "2026-01-01T00:00:05.000Z" }));
+    // Queue-failed: retryable failure with a scheduled retry, no submission.
+    await store.record(makeRecord({ id: "queue-failed-due", status: "failed", submittedHash: null, txHash: null, nextRetryAt: "2026-01-01T00:00:05.000Z" }));
+    await store.record(makeRecord({ id: "queue-failed-later", status: "failed", submittedHash: null, txHash: null, nextRetryAt: "2026-01-01T00:01:00.000Z" }));
+    await store.record(makeRecord({ id: "queued", status: "queued", nextRetryAt: null }));
+
+    const due = (await store.listDue(now)).map((r) => r.id).sort();
+    assert.deepEqual(due, ["queue-failed-due", "queued"]);
+  });
+
   test(`${harness.name}: listDue returns the earliest retry first`, async () => {
     const store = harness.create();
     await store.record(makeRecord({ id: "third", status: "failed", nextRetryAt: "2026-01-01T00:00:09.000Z" }));
@@ -453,7 +471,11 @@ test("SQLite: records survive a process-style reconnect", async () => {
     attempt: 2,
     errorClass: "transient",
     nextRetryAt: "2026-01-01T00:05:00.000Z",
-    submittedHash: "submitted-hash",
+    // #378: a queue-failed record carries no submission hash — fail() never
+    // persists one. A failed record WITH a submittedHash is a terminal
+    // on-chain outcome (reconciler-failed) and listDue never picks it up,
+    // so this reconnect test seeds the retryable shape (hash null).
+    submittedHash: null,
   });
   await first.record(record);
 

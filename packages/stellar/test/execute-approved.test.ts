@@ -198,3 +198,33 @@ test("executeApproved records the signed hash when submission fails", async () =
     assert.equal(fixture.signer.calls, 1);
   });
 });
+
+test("executeApproved aborts on a pre-aborted signal without signing (AbortSignal parity, #275)", async () => {
+  const fixture = await createFixture();
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    () => fixture.pipeline.executeApproved(fixture.approval.id, "reviewer-1", { signal: controller.signal }),
+    (err: unknown) => err instanceof Error && err.name === "AbortError"
+  );
+  // Nothing was signed and the approval stays approved (retryable).
+  assert.equal(fixture.signer.calls, 0);
+  const savedApproval = await fixture.approvalStore.get(fixture.approval.id);
+  assert.equal(savedApproval?.status, "approved");
+});
+
+test("executeApproved invokes onBeforeSubmit before submitting (#275)", async () => {
+  await withOfflineAccount(async () => {
+    const fixture = await createFixture();
+    let beforeSubmitCalls = 0;
+    const result = await fixture.pipeline.executeApproved(fixture.approval.id, "reviewer-1", {
+      onBeforeSubmit: () => {
+        beforeSubmitCalls++;
+      },
+    });
+
+    assert.equal(result.status, "submitted");
+    assert.equal(beforeSubmitCalls, 1);
+  });
+});

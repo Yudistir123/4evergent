@@ -577,3 +577,170 @@ test("ExecutionQueue: unrelated AbortError when signal is not aborted follows no
   assert.match(stored?.error ?? "", /fetch timeout aborted/i);
 });
 
+
+test("ExecutionQueue: processDue never re-executes reconciler-failed records (#378)", async () => {
+  const store = new InMemoryExecutionStore();
+  let executed = 0;
+  const pipelineExecutor = async (_record: ExecutionRecord): Promise<ExecutionResult> => {
+    executed++;
+    return {
+      record: makeExecution(),
+      success: true,
+      status: "submitted",
+      txHash: "tx-123",
+      error: null,
+      errorClass: null,
+    };
+  };
+  const queue = new ExecutionQueue(store, pipelineExecutor, async () => ({
+    accountId: () => "GACCOUNT",
+    sequenceNumber: () => "1",
+    incrementSequenceNumber: () => {},
+  }));
+  // Reconciler-failed: terminal on-chain outcome, no retry scheduled — and
+  // a stale-past nextRetryAt left over from an earlier attempt. Neither
+  // variant may ever be claimed again, however many ticks pass.
+  const failedNull = makeExecution({
+    status: "failed",
+    submittedHash: "onchain-hash",
+    txHash: "onchain-hash",
+    error: "Transaction failed on-chain",
+    nextRetryAt: null,
+  });
+  const failedStale = makeExecution({
+    status: "failed",
+    submittedHash: "onchain-hash",
+    txHash: "onchain-hash",
+    error: "Transaction failed on-chain",
+    nextRetryAt: "2026-01-01T00:00:05.000Z",
+  });
+  // Queue-failed with a due scheduled retry still runs.
+  const failedDue = makeExecution({
+    status: "failed",
+    submittedHash: null,
+    txHash: null,
+    nextRetryAt: "2026-01-01T00:00:05.000Z",
+  });
+  await store.record(failedNull);
+  await store.record(failedStale);
+  await store.record(failedDue);
+
+  const started = await queue.processDue("2026-01-01T00:00:10.000Z");
+  assert.equal(started, 1);
+  assert.equal(executed, 1);
+
+  assert.equal((await store.get(failedNull.id))?.status, "failed");
+  assert.equal((await store.get(failedNull.id))?.attempt, 0);
+  assert.equal((await store.get(failedStale.id))?.status, "failed");
+  assert.equal((await store.get(failedStale.id))?.attempt, 0);
+  assert.equal((await store.get(failedDue.id))?.status, "submitted");
+
+  // A second tick still never touches the reconciler-failed records.
+  const startedAgain = await queue.processDue("2026-01-01T00:00:10.000Z");
+  assert.equal(startedAgain, 0);
+  assert.equal(executed, 1);
+  assert.equal((await store.get(failedNull.id))?.attempt, 0);
+  assert.equal((await store.get(failedStale.id))?.attempt, 0);
+});
+
+test("ExecutionQueue: complete() clears stale nextRetryAt and errorClass on success (#378)", async () => {
+  const store = new InMemoryExecutionStore();
+  const pipelineExecutor = async (_record: ExecutionRecord): Promise<ExecutionResult> => ({
+    record: makeExecution(),
+    success: true,
+    status: "submitted",
+    txHash: "tx-new",
+    submittedHash: "tx-new",
+    error: null,
+    errorClass: null,
+  });
+  const queue = new ExecutionQueue(store, pipelineExecutor, async () => ({
+    accountId: () => "GACCOUNT",
+    sequenceNumber: () => "1",
+    incrementSequenceNumber: () => {},
+  }));
+  // A retried-then-submitted record still carrying its previous attempt's
+  // retry schedule and error classification.
+  const execution = makeExecution({
+    status: "queued",
+    attempt: 1,
+    nextRetryAt: "2026-01-01T00:00:05.000Z",
+    errorClass: "transient",
+  });
+  await store.record(execution);
+  await queue.processDue("2026-01-01T00:00:10.000Z");
+
+  const updated = await store.get(execution.id);
+  assert.equal(updated?.status, "submitted");
+  assert.equal(updated?.nextRetryAt, null);
+  assert.equal(updated?.errorClass, null);
+});
+
+test("ExecutionQueue: fail() pre-check consults the current attempt's hash, not the snapshot (#378)", async () => {
+  const store = new InMemoryExecutionStore();
+  const consultedHashes: string[] = [];
+  const pipelineExecutor = async (_record: ExecutionRecord): Promise<ExecutionResult> => ({
+    record: makeExecution(),
+    success: false,
+    status: "failed",
+    error: "network timeout",
+    errorClass: "transient",
+    txHash: "current-hash",
+    submittedHash: "current-hash",
+  });
+  const queue = new ExecutionQueue(
+    store,
+    pipelineExecutor,
+    async () => ({
+      accountId: () => "GACCOUNT",
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    }),
+    {
+      retryPolicy: { maxRetries: 3, baseDelayMs: 10, maxDelayMs: 50 },
+      preCheck: async (txHash: string) => {
+        consultedHashes.push(txHash);
+        // The OLD hash was found on-chain (previous attempt); the CURRENT
+        // attempt's hash was never submitted.
+        return txHash === "old-hash" ? "found" : "not_found";
+      },
+    }
+  );
+  const execution = makeExecution({ status: "queued", submittedHash: "old-hash" });
+  await store.record(execution);
+  await queue.processDue();
+
+  // The pre-check ran against the current attempt's hash only.
+  assert.deepEqual(consultedHashes, ["current-hash"]);
+  // …so the retry was scheduled instead of dead-lettering on the old hash.
+  const updated = await store.get(execution.id);
+  assert.equal(updated?.status, "failed");
+  assert.ok(updated?.nextRetryAt, "retry should be scheduled");
+});
+
+test("ExecutionQueue: retry() re-queues as a fresh attempt without the old hashes (#378)", async () => {
+  const store = new InMemoryExecutionStore();
+  const queue = new ExecutionQueue(store, async (_record: ExecutionRecord): Promise<ExecutionResult> => ({
+    record: makeExecution(),
+    success: true,
+    status: "submitted",
+    txHash: "tx-123",
+    error: null,
+    errorClass: null,
+  }));
+  const execution = makeExecution({
+    status: "failed",
+    attempt: 1,
+    submittedHash: "old-hash",
+    txHash: "old-hash",
+    nextRetryAt: null,
+  });
+  await store.record(execution);
+
+  const res = await queue.retry(execution.id, 3);
+  assert.equal(res.status, "queued");
+  const updated = await store.get(execution.id);
+  assert.equal(updated?.status, "queued");
+  assert.equal(updated?.txHash, null);
+  assert.equal(updated?.submittedHash, null);
+});
