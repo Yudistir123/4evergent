@@ -53,7 +53,7 @@ test("every documented client route uses the expected method and path", async ()
   const routes: Array<{ call: () => Promise<unknown>; method: string; path: string }> = [
     { call: () => client.health(), method: "GET", path: "/health" },
     { call: () => client.createAgent({ displayName: "bot" }), method: "POST", path: "/agents" },
-    { call: () => client.listAgents(), method: "GET", path: "/agents" },
+    { call: () => client.listAgents({ limit: 10, offset: 2 }), method: "GET", path: "/agents?limit=10&offset=2" },
     { call: () => client.getAgent("agent id"), method: "GET", path: "/agents/agent%20id" },
     { call: () => client.updateAgentStatus("a", "paused"), method: "PATCH", path: "/agents/a/status" },
     { call: () => client.submitIntent("a", intent, { idempotencyKey: "key-1" }), method: "POST", path: "/agents/a/intents" },
@@ -135,4 +135,23 @@ test("message-shaped API failures remain available on ApiError", async () => {
     assert.equal(error.body.approvalId, "a1");
     return true;
   });
+});
+
+test("listAgents() with no options requests /agents with no query string", async () => {
+  const { client, calls } = setup(200, { agents: [], hasMore: false, truncated: false, total: 0 });
+  const result = await client.listAgents();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url, "https://api.example.test/agents");
+  assert.equal(calls[0]!.method, "GET");
+  assert.deepEqual(result, { agents: [], hasMore: false, truncated: false, total: 0 });
+});
+
+test("listAgents() exposes pagination fields from the response", async () => {
+  const agents = [{ id: "a1", displayName: "A" }];
+  const { client } = setup(200, { agents, hasMore: true, truncated: true, total: 3 });
+  const result = await client.listAgents({ limit: 2 });
+  assert.deepEqual(result.agents, agents);
+  assert.equal(result.hasMore, true);
+  assert.equal(result.truncated, true);
+  assert.equal(result.total, 3);
 });

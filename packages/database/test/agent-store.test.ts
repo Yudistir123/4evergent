@@ -21,6 +21,10 @@ function removeTemporaryDatabase(dbPath: string): void {
 }
 
 function testStores(name: string, makeStore: () => InMemoryAgentStore | SQLiteAgentStore) {
+  // createdAt has millisecond resolution, so agents created in a tight loop
+  // can share a timestamp and sort ties keep insertion order. The offset
+  // tests below space creates out so newest-first ordering is meaningful.
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   test(`${name}: create and get`, async () => {
     const { store, cleanup } = makeStore();
     try {
@@ -444,6 +448,101 @@ function testStores(name: string, makeStore: () => InMemoryAgentStore | SQLiteAg
       }
       const list = await store.listByCapability("owner-a", "payment", -5);
       assert.equal(list.length, 1);
+    } finally {
+      cleanup?.();
+    }
+  });
+
+  test(`${name}: listByOwner offset walks pages without duplicates (#380)`, async () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const created = [];
+      for (let i = 0; i < 5; i++) {
+        created.push(await store.create({ displayName: `Agent ${i}`, ownerId: "owner-a" }));
+        await sleep(2);
+      }
+      // Newest-first: last created is first.
+      const page1 = await store.listByOwner("owner-a", 2, 0);
+      const page2 = await store.listByOwner("owner-a", 2, 2);
+      const page3 = await store.listByOwner("owner-a", 2, 4);
+      assert.equal(page1.length, 2);
+      assert.equal(page2.length, 2);
+      assert.equal(page3.length, 1);
+      assert.deepEqual(page1.map((a) => a.id), [created[4]!.id, created[3]!.id]);
+      assert.deepEqual(page2.map((a) => a.id), [created[2]!.id, created[1]!.id]);
+      assert.deepEqual(page3.map((a) => a.id), [created[0]!.id]);
+      const allIds = [...page1, ...page2, ...page3].map((a) => a.id);
+      assert.equal(new Set(allIds).size, 5, "no duplicate across pages");
+
+      // Offset past the end returns an empty page, never an error.
+      assert.deepEqual(await store.listByOwner("owner-a", 2, 5), []);
+      assert.deepEqual(await store.listByOwner("owner-a", 2, 100), []);
+    } finally {
+      cleanup?.();
+    }
+  });
+
+  test(`${name}: listByOwner negative offset clamps to 0`, async () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const created = [];
+      for (let i = 0; i < 3; i++) {
+        created.push(await store.create({ displayName: `Agent ${i}`, ownerId: "owner-a" }));
+        await sleep(2);
+      }
+      const list = await store.listByOwner("owner-a", 2, -5);
+      assert.deepEqual(list.map((a) => a.id), [created[2]!.id, created[1]!.id]);
+    } finally {
+      cleanup?.();
+    }
+  });
+
+  test(`${name}: listByCapability offset applies after the capability filter (#380)`, async () => {
+    const { store, cleanup } = makeStore();
+    try {
+      const payment = [];
+      for (let i = 0; i < 5; i++) {
+        payment.push(
+          await store.create({ displayName: `Pay ${i}`, ownerId: "owner-a", capabilities: ["payment"] })
+        );
+        await sleep(2);
+      }
+      // Non-matching agents interleaved: offset must skip matching agents
+      // only, not rows of the unfiltered list.
+      await store.create({ displayName: "Other 1", ownerId: "owner-a", capabilities: ["trustline"] });
+      await store.create({ displayName: "Other 2", ownerId: "owner-a", capabilities: ["trustline"] });
+
+      const page1 = await store.listByCapability("owner-a", "payment", 2, 0);
+      const page2 = await store.listByCapability("owner-a", "payment", 2, 2);
+      const page3 = await store.listByCapability("owner-a", "payment", 2, 4);
+      assert.equal(page1.length, 2);
+      assert.equal(page2.length, 2);
+      assert.equal(page3.length, 1);
+      assert.deepEqual(page1.map((a) => a.id), [payment[4]!.id, payment[3]!.id]);
+      assert.deepEqual(page2.map((a) => a.id), [payment[2]!.id, payment[1]!.id]);
+      assert.deepEqual(page3.map((a) => a.id), [payment[0]!.id]);
+      const allIds = [...page1, ...page2, ...page3].map((a) => a.id);
+      assert.equal(new Set(allIds).size, 5, "no duplicate across pages");
+    } finally {
+      cleanup?.();
+    }
+  });
+
+  test(`${name}: countByOwner and countByCapability ignore limit/offset`, async () => {
+    const { store, cleanup } = makeStore();
+    try {
+      for (let i = 0; i < 3; i++) {
+        await store.create({ displayName: `Pay ${i}`, ownerId: "owner-a", capabilities: ["payment"] });
+      }
+      await store.create({ displayName: "Other", ownerId: "owner-a", capabilities: ["trustline"] });
+      await store.create({ displayName: "Foreign", ownerId: "owner-b", capabilities: ["payment"] });
+      assert.equal(await store.countByOwner("owner-a"), 4);
+      assert.equal(await store.countByOwner("owner-b"), 1);
+      assert.equal(await store.countByOwner("owner-none"), 0);
+      assert.equal(await store.countByCapability("owner-a", "payment"), 3);
+      assert.equal(await store.countByCapability("owner-a", "trustline"), 1);
+      assert.equal(await store.countByCapability("owner-a", "missing"), 0);
+      assert.equal(await store.countByCapability("owner-b", "payment"), 1);
     } finally {
       cleanup?.();
     }

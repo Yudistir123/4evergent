@@ -94,7 +94,40 @@ export interface IntentResponse {
 export const api = {
   health: () => request<{ status: string; signerAccountId: string }>('/health'),
 
-  listAgents: () => request<{ agents: AgentRecord[] }>('/agents'),
+  listAgents: (limit?: number, offset?: number) => {
+    const params = new URLSearchParams();
+    if (limit !== undefined) params.set('limit', String(limit));
+    if (offset !== undefined) params.set('offset', String(offset));
+    const query = params.toString();
+    return request<{ agents: AgentRecord[]; hasMore: boolean; truncated: boolean; total: number }>(
+      `/agents${query ? `?${query}` : ''}`
+    );
+  },
+
+  /**
+   * Load the owner's full agent list by paging through GET /agents.
+   * The API caps a single page at 200 rows, so one call can silently drop
+   * the oldest agents; this walks every page instead. `truncated` is true
+   * only when the walk stopped early at the API's offset ceiling (10_000),
+   * i.e. loaded agents are fewer than the server-reported total.
+   */
+  listAllAgents: async () => {
+    const PAGE_SIZE = 200;
+    const agents: AgentRecord[] = [];
+    let offset = 0;
+    let total = 0;
+    for (;;) {
+      const page = await api.listAgents(PAGE_SIZE, offset);
+      agents.push(...page.agents);
+      total = page.total;
+      if (!page.hasMore) break;
+      offset += page.agents.length;
+      // Guard against a server that keeps reporting hasMore without
+      // advancing the page (would loop forever appending duplicates).
+      if (page.agents.length === 0) break;
+    }
+    return { agents, total, truncated: agents.length < total };
+  },
 
   getAgent: (agentId: string) => request<AgentRecord>(`/agents/${encodeURIComponent(agentId)}`),
 

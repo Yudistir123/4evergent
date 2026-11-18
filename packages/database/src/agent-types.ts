@@ -30,8 +30,12 @@ export interface AgentStore {
   create(input: CreateAgentInput): Promise<Agent>;
   get(id: string): Promise<Agent | null>;
   getForOwner(id: string, ownerId: string): Promise<Agent | null>;
-  listByOwner(ownerId: string, limit?: number): Promise<Agent[]>;
-  listByCapability(ownerId: string, capability: string, limit?: number): Promise<Agent[]>;
+  listByOwner(ownerId: string, limit?: number, offset?: number): Promise<Agent[]>;
+  listByCapability(ownerId: string, capability: string, limit?: number, offset?: number): Promise<Agent[]>;
+  /** Total agents owned by `ownerId` (no limit/offset applied). */
+  countByOwner(ownerId: string): Promise<number>;
+  /** Total agents owned by `ownerId` with the given capability. */
+  countByCapability(ownerId: string, capability: string): Promise<number>;
   update(id: string, patch: Partial<Agent>): Promise<Agent | null>;
   transitionStatus(id: string, status: AgentStatus): Promise<AgentStatusTransitionResult>;
   delete(id: string): Promise<boolean>;

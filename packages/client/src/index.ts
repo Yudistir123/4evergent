@@ -244,8 +244,18 @@ export class Client {
     return this.request<{ agent: Agent }>("/agents", { method: "POST", body: JSON.stringify(body) });
   }
 
-  listAgents(): Promise<{ agents: AgentSummary[] }> {
-    return this.request<{ agents: AgentSummary[] }>("/agents");
+  listAgents(options: RequestOptions = {}): Promise<{
+    agents: AgentSummary[];
+    hasMore: boolean;
+    truncated: boolean;
+    total: number;
+  }> {
+    return this.request<{
+      agents: AgentSummary[];
+      hasMore: boolean;
+      truncated: boolean;
+      total: number;
+    }>(withPagination("/agents", options));
   }
 
   getAgent(agentId: string): Promise<AgentDetails> {

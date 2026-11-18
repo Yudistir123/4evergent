@@ -6,6 +6,8 @@ import { StatusBadge, Skeleton, EmptyState } from '../components';
 
 export default function Agents() {
   const [agents, setAgents] = useState<AgentRecord[] | null>(null);
+  const [totalAgents, setTotalAgents] = useState<number | null>(null);
+  const [agentsTruncated, setAgentsTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState('');
@@ -18,8 +20,14 @@ export default function Agents() {
   const titleId = 'create-agent-title';
 
   const load = () => {
-    api.listAgents()
-      .then((a) => setAgents(a.agents))
+    // Page through GET /agents so owners with more than one page (200) of
+    // agents see all of them instead of silently losing the oldest ones.
+    api.listAllAgents()
+      .then((a) => {
+        setAgents(a.agents);
+        setTotalAgents(a.total);
+        setAgentsTruncated(a.truncated);
+      })
       .catch((e: any) => setError(e.message));
   };
 
@@ -73,6 +81,7 @@ export default function Agents() {
       setCapabilities('');
       setShowCreate(false);
       setAgents((prev) => [...(prev ?? []), res.agent]);
+      setTotalAgents((prev) => (prev === null ? prev : prev + 1));
       navigate(`/agents/${res.agent.id}`);
     } catch (e: any) {
       setCreateError(e.message);
@@ -100,6 +109,12 @@ export default function Agents() {
           Create Agent
         </button>
       </div>
+
+      {agentsTruncated && totalAgents !== null && (
+        <div className="notice-banner" role="status">
+          Showing {agents.length} of {totalAgents} agents — the list is truncated at the pagination limit and older agents are not shown.
+        </div>
+      )}
 
       {agents.length === 0 && !showCreate ? (
         <EmptyState

@@ -32,7 +32,9 @@ export default function Overview() {
       try {
         const [h, a, ap, act] = await Promise.all([
           api.health(),
-          api.listAgents(),
+          // Page through GET /agents so the status counts cover every agent,
+          // not just the first 200.
+          api.listAllAgents(),
           api.listApprovals('pending_approval'),
           api.listActivity(),
         ]);

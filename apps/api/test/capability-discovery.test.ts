@@ -112,7 +112,7 @@ function runApiCapabilityTests(backendName: string, makeStore: () => { store: In
 
       const res = await get(`${baseUrl}/agents?capability=unknown_capability`);
       assert.equal(res.status, 200);
-      assert.deepEqual(res.body, { agents: [] });
+      assert.deepEqual(res.body, { agents: [], hasMore: false, truncated: false, total: 0 });
     } finally {
       await server.close();
       cleanup?.();
@@ -141,17 +141,17 @@ function runApiCapabilityTests(backendName: string, makeStore: () => { store: In
       // Prefix must not match
       const prefixRes = await get(`${baseUrl}/agents?capability=pay`);
       assert.equal(prefixRes.status, 200);
-      assert.deepEqual(prefixRes.body, { agents: [] });
+      assert.deepEqual(prefixRes.body, { agents: [], hasMore: false, truncated: false, total: 0 });
 
       // Substring / superstring must not match
       const superRes = await get(`${baseUrl}/agents?capability=payment_batching`);
       assert.equal(superRes.status, 200);
-      assert.deepEqual(superRes.body, { agents: [] });
+      assert.deepEqual(superRes.body, { agents: [], hasMore: false, truncated: false, total: 0 });
 
       // Case mismatch must not match
       const caseRes = await get(`${baseUrl}/agents?capability=Payment`);
       assert.equal(caseRes.status, 200);
-      assert.deepEqual(caseRes.body, { agents: [] });
+      assert.deepEqual(caseRes.body, { agents: [], hasMore: false, truncated: false, total: 0 });
     } finally {
       await server.close();
       cleanup?.();

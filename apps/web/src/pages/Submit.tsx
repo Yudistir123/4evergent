@@ -28,7 +28,9 @@ export default function Submit() {
   const [result, setResult] = useState<SubmitResult | null>(null);
 
   useEffect(() => {
-    api.listAgents()
+    // Page through GET /agents so the dropdown lists every agent, not just
+    // the first 200.
+    api.listAllAgents()
       .then((a) => {
         setAgents(a.agents.map((x) => ({ id: x.id, displayName: x.displayName })));
         if (a.agents.length > 0) setSelectedAgent(a.agents[0]!.id);

@@ -50,6 +50,7 @@ import {
   type PolicyConfigStore,
   createActivity,
   isOffsetAtCeiling,
+  clampOffset,
 } from "@4evergent/database";
 import type { PolicyRules, Agent, RequestContext, AuthorizationService, AuthProvider, AuthenticatedPrincipal } from "@4evergent/shared";
 import { createAuthModule, type PrincipalResolution } from "./auth.js";
@@ -999,6 +1000,8 @@ export async function createApiServer(options: ServerOptions) {
     const capability = urlObj.searchParams.get("capability");
     const hasLimit = urlObj.searchParams.has("limit");
     const rawLimit = urlObj.searchParams.get("limit");
+    const hasOffset = urlObj.searchParams.has("offset");
+    const rawOffset = urlObj.searchParams.get("offset");
 
     let limit: number | undefined;
     if (hasLimit) {
@@ -1013,9 +1016,31 @@ export async function createApiServer(options: ServerOptions) {
       limit = Math.max(1, Math.min(MAX_LIMIT, parsed));
     }
 
-    const all = capability !== null
-      ? await agentStore.listByCapability(ctx.ownerId!, capability, limit)
-      : await agentStore.listByOwner(ctx.ownerId!, limit);
+    // Same strict validation as `limit`: empty, non-numeric, or fractional
+    // values are rejected. A negative offset clamps to 0 and an offset past
+    // MAX_OFFSET clamps to MAX_OFFSET (see clampOffset).
+    let offset = 0;
+    if (hasOffset) {
+      if (rawOffset === null || rawOffset.trim() === "") {
+        return apiError(res, "VALIDATION_ERROR", { message: "offset must be a valid integer" });
+      }
+      const parsed = Number(rawOffset);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        return apiError(res, "VALIDATION_ERROR", { message: "offset must be a valid integer" });
+      }
+      offset = clampOffset(parsed);
+    }
+
+    const effectiveLimit = limit ?? MAX_LIMIT;
+    const [all, total] = capability !== null
+      ? [
+          await agentStore.listByCapability(ctx.ownerId!, capability, effectiveLimit, offset),
+          await agentStore.countByCapability(ctx.ownerId!, capability),
+        ]
+      : [
+          await agentStore.listByOwner(ctx.ownerId!, effectiveLimit, offset),
+          await agentStore.countByOwner(ctx.ownerId!),
+        ];
 
     const agentList = all.map((a) => ({
       id: a.id,
@@ -1028,7 +1053,12 @@ export async function createApiServer(options: ServerOptions) {
       active: a.active,
       createdAt: a.createdAt,
     }));
-    return json(res, { agents: agentList });
+    // Same semantics as GET /approvals: `truncated` means more matching rows
+    // exist beyond this page; `hasMore` additionally requires the client to
+    // actually be able to fetch them (offset ceiling ends pagination).
+    const truncated = offset + agentList.length < total;
+    const hasMore = truncated && !isOffsetAtCeiling(offset);
+    return json(res, { agents: agentList, hasMore, truncated, total });
   }
 
   async function handleCreateAgent(ctx: RequestContext, req: any, res: any) {

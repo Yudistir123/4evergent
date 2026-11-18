@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import type { Agent, AgentStatus } from "@4evergent/shared";
 import { getSharedConnection } from "./shared-connection.js";
+import { clampOffset } from "./pagination.js";
 import { getAllowedPreviousAgentStatuses, type AgentStatusTransitionResult, type AgentStore, type CreateAgentInput } from "./agent-types.js";
 
 export const MAX_LIMIT = 200;
@@ -42,23 +43,43 @@ export class InMemoryAgentStore implements AgentStore {
     return rec?.ownerId === ownerId ? rec : null;
   }
 
-  async listByOwner(ownerId: string, limit = MAX_LIMIT): Promise<Agent[]> {
+  async listByOwner(ownerId: string, limit = MAX_LIMIT, offset = 0): Promise<Agent[]> {
+    const safeLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
+    const safeOffset = clampOffset(offset);
     return [...this.records.values()]
       .filter((r) => r.ownerId === ownerId)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(0, Math.max(1, Math.min(limit, MAX_LIMIT)));
+      .slice(safeOffset, safeOffset + safeLimit);
   }
 
   async listByCapability(
     ownerId: string,
     capability: string,
-    limit = MAX_LIMIT
+    limit = MAX_LIMIT,
+    offset = 0
   ): Promise<Agent[]> {
     const safeLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
+    const safeOffset = clampOffset(offset);
     return [...this.records.values()]
       .filter((r) => r.ownerId === ownerId && (r.capabilities ?? []).includes(capability))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(0, safeLimit);
+      .slice(safeOffset, safeOffset + safeLimit);
+  }
+
+  async countByOwner(ownerId: string): Promise<number> {
+    let n = 0;
+    for (const r of this.records.values()) {
+      if (r.ownerId === ownerId) n++;
+    }
+    return n;
+  }
+
+  async countByCapability(ownerId: string, capability: string): Promise<number> {
+    let n = 0;
+    for (const r of this.records.values()) {
+      if (r.ownerId === ownerId && (r.capabilities ?? []).includes(capability)) n++;
+    }
+    return n;
   }
 
   async update(id: string, patch: Partial<Agent>): Promise<Agent | null> {
@@ -198,20 +219,23 @@ export class SQLiteAgentStore implements AgentStore {
     return row ? rowToAgent(row) : null;
   }
 
-  async listByOwner(ownerId: string, limit = MAX_LIMIT): Promise<Agent[]> {
+  async listByOwner(ownerId: string, limit = MAX_LIMIT, offset = 0): Promise<Agent[]> {
     const safeLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
+    const safeOffset = clampOffset(offset);
     const rows = this.db
-      .prepare("SELECT * FROM agents WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?")
-      .all(ownerId, safeLimit) as unknown as AgentRow[];
+      .prepare("SELECT * FROM agents WHERE owner_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(ownerId, safeLimit, safeOffset) as unknown as AgentRow[];
     return rows.map(rowToAgent);
   }
 
   async listByCapability(
     ownerId: string,
     capability: string,
-    limit = MAX_LIMIT
+    limit = MAX_LIMIT,
+    offset = 0
   ): Promise<Agent[]> {
     const safeLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
+    const safeOffset = clampOffset(offset);
     const rows = this.db
       .prepare(
         `SELECT * FROM agents
@@ -219,10 +243,29 @@ export class SQLiteAgentStore implements AgentStore {
            AND json_valid(capabilities_json)
            AND EXISTS (SELECT 1 FROM json_each(agents.capabilities_json) WHERE value = ?)
          ORDER BY created_at DESC
-         LIMIT ?`
+         LIMIT ? OFFSET ?`
       )
-      .all(ownerId, capability, safeLimit) as unknown as AgentRow[];
+      .all(ownerId, capability, safeLimit, safeOffset) as unknown as AgentRow[];
     return rows.map(rowToAgent);
+  }
+
+  async countByOwner(ownerId: string): Promise<number> {
+    const row = this.db
+      .prepare("SELECT COUNT(*) as count FROM agents WHERE owner_id = ?")
+      .get(ownerId) as unknown as { count: number };
+    return row.count;
+  }
+
+  async countByCapability(ownerId: string, capability: string): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as count FROM agents
+         WHERE owner_id = ?
+           AND json_valid(capabilities_json)
+           AND EXISTS (SELECT 1 FROM json_each(agents.capabilities_json) WHERE value = ?)`
+      )
+      .get(ownerId, capability) as unknown as { count: number };
+    return row.count;
   }
 
   async update(id: string, patch: Partial<Agent>): Promise<Agent | null> {

@@ -4,14 +4,14 @@ import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import Agents from '../Agents';
 
-const { mockListAgents, mockCreateAgent } = vi.hoisted(() => ({
-  mockListAgents: vi.fn(),
+const { mockListAllAgents, mockCreateAgent } = vi.hoisted(() => ({
+  mockListAllAgents: vi.fn(),
   mockCreateAgent: vi.fn(),
 }));
 
 vi.mock('../../api', () => ({
   api: {
-    listAgents: mockListAgents,
+    listAllAgents: mockListAllAgents,
     createAgent: mockCreateAgent,
   },
 }));
@@ -22,7 +22,7 @@ describe('Agents page', () => {
   });
 
   it('renders loading state on mount', () => {
-    mockListAgents.mockReturnValue(new Promise(() => {}));
+    mockListAllAgents.mockReturnValue(new Promise(() => {}));
     render(
       <MemoryRouter>
         <Agents />
@@ -33,7 +33,7 @@ describe('Agents page', () => {
   });
 
   it('renders error state when api.listAgents fails', async () => {
-    mockListAgents.mockRejectedValue(new Error('Failed to fetch agents'));
+    mockListAllAgents.mockRejectedValue(new Error('Failed to fetch agents'));
     render(
       <MemoryRouter>
         <Agents />
@@ -50,7 +50,7 @@ describe('Agents page', () => {
   });
 
   it('renders empty state when there are no agents', async () => {
-    mockListAgents.mockResolvedValue({ agents: [] });
+    mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
     render(
       <MemoryRouter>
         <Agents />
@@ -66,7 +66,7 @@ describe('Agents page', () => {
   });
 
   it('renders table with fetched agents data', async () => {
-    mockListAgents.mockResolvedValue({
+    mockListAllAgents.mockResolvedValue({
       agents: [
         {
           id: 'agent-1',
@@ -81,6 +81,8 @@ describe('Agents page', () => {
           updatedAt: '2026-01-01T00:00:00Z',
         },
       ],
+      total: 1,
+      truncated: false,
     });
 
     render(
@@ -99,9 +101,75 @@ describe('Agents page', () => {
     expect(screen.getByRole('link', { name: 'View' })).toHaveAttribute('href', '/agents/agent-1');
   });
 
+  it('shows an explicit truncation notice when the full list could not be loaded', async () => {
+    mockListAllAgents.mockResolvedValue({
+      agents: [
+        {
+          id: 'agent-1',
+          displayName: 'Treasury Agent',
+          description: '',
+          ownerId: 'owner-1',
+          stellarAddress: '',
+          capabilities: [],
+          status: 'active',
+          active: true,
+          createdAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+      total: 3,
+      truncated: true,
+    });
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Treasury Agent')).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent('Showing 1 of 3 agents');
+  });
+
+  it('shows no truncation notice when the full list was loaded', async () => {
+    mockListAllAgents.mockResolvedValue({
+      agents: [
+        {
+          id: 'agent-1',
+          displayName: 'Treasury Agent',
+          description: '',
+          ownerId: 'owner-1',
+          stellarAddress: '',
+          capabilities: [],
+          status: 'active',
+          active: true,
+          createdAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+      total: 1,
+      truncated: false,
+    });
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Treasury Agent')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
   describe('Create Agent modal', () => {
     it('opens create modal when clicking Create Agent button', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       render(
         <MemoryRouter>
           <Agents />
@@ -121,7 +189,7 @@ describe('Agents page', () => {
     });
 
     it('exposes the modal as an accessible dialog', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       render(
         <MemoryRouter>
           <Agents />
@@ -145,7 +213,7 @@ describe('Agents page', () => {
     });
 
     it('closes the modal when Escape is pressed', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       render(
         <MemoryRouter>
           <Agents />
@@ -167,7 +235,7 @@ describe('Agents page', () => {
     });
 
     it('shows validation error when name is empty', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       render(
         <MemoryRouter>
           <Agents />
@@ -192,7 +260,7 @@ describe('Agents page', () => {
     });
 
     it('submits form with valid input and calls api.createAgent with expected body', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       mockCreateAgent.mockResolvedValue({
         agent: {
           id: 'agent-new-123',
@@ -246,7 +314,7 @@ describe('Agents page', () => {
     });
 
     it('shows API error when createAgent rejects', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       mockCreateAgent.mockRejectedValue(new Error('Agent name already exists'));
 
       render(
@@ -275,7 +343,7 @@ describe('Agents page', () => {
     });
 
     it('closes modal when clicking Cancel button', async () => {
-      mockListAgents.mockResolvedValue({ agents: [] });
+      mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
       render(
         <MemoryRouter>
           <Agents />

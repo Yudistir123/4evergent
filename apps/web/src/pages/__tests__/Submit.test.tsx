@@ -2,15 +2,15 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { test, expect, describe, vi, beforeEach } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 
-const { mockSubmitPayment, mockSubmitTrustline, mockListAgents } = vi.hoisted(() => ({
+const { mockSubmitPayment, mockSubmitTrustline, mockListAllAgents } = vi.hoisted(() => ({
   mockSubmitPayment: vi.fn(),
   mockSubmitTrustline: vi.fn(),
-  mockListAgents: vi.fn(),
+  mockListAllAgents: vi.fn(),
 }));
 
 vi.mock('../../api', () => ({
   api: {
-    listAgents: mockListAgents,
+    listAllAgents: mockListAllAgents,
     submitPayment: mockSubmitPayment,
     submitTrustline: mockSubmitTrustline,
   },
@@ -29,8 +29,10 @@ function renderSubmit() {
 describe('Submit', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockListAgents.mockResolvedValue({
+    mockListAllAgents.mockResolvedValue({
       agents: [{ id: 'agent-1', displayName: 'Test Agent' }],
+      total: 1,
+      truncated: false,
     });
   });
 

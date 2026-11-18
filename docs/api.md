@@ -233,8 +233,11 @@ List caller's agents, with optional filtering by capability and limit clamping.
 Query parameters:
 - `capability` (string, optional): Filter agents by exact capability match. Case-sensitive.
 - `limit` (number, optional): Maximum agents to return (clamped between 1 and 200, default 200).
+- `offset` (number, optional): Number of matching agents to skip (clamped between 0 and 10_000, default 0). Applied after the capability filter, so paging walks the filtered set.
 
-Returns `{ "agents": AgentRecord[] }`.
+`limit` and `offset` must be valid integers when present: an empty, non-numeric, or fractional value returns `400 VALIDATION_ERROR`.
+
+Returns `{ "agents": AgentRecord[], "hasMore": boolean, "truncated": boolean, "total": number }`, where `total` is the number of matching agents owned by the caller, `truncated` is true when more matching agents exist beyond this page (`offset + agents.length < total`), and `hasMore` is `truncated` unless the offset ceiling (10_000) ends pagination.
 
 Each returned `AgentRecord` includes its full `capabilities` string array. If no agents match the given `capability` (or the caller owns no agents), the endpoint returns `200` with `{ "agents": [] }` — never `404` or `500`.
 

@@ -6,13 +6,13 @@ import Overview from '../Overview';
 
 const {
   mockHealth,
-  mockListAgents,
+  mockListAllAgents,
   mockListApprovals,
   mockListActivity,
   mockGetOverviewAttention,
 } = vi.hoisted(() => ({
   mockHealth: vi.fn(),
-  mockListAgents: vi.fn(),
+  mockListAllAgents: vi.fn(),
   mockListApprovals: vi.fn(),
   mockListActivity: vi.fn(),
   mockGetOverviewAttention: vi.fn(),
@@ -21,7 +21,7 @@ const {
 vi.mock('../../api', () => ({
   api: {
     health: mockHealth,
-    listAgents: mockListAgents,
+    listAllAgents: mockListAllAgents,
     listApprovals: mockListApprovals,
     listActivity: mockListActivity,
     getOverviewAttention: mockGetOverviewAttention,
@@ -35,7 +35,7 @@ describe('Overview page', () => {
 
   it('renders loading skeleton on mount', () => {
     mockHealth.mockReturnValue(new Promise(() => {}));
-    mockListAgents.mockReturnValue(new Promise(() => {}));
+    mockListAllAgents.mockReturnValue(new Promise(() => {}));
     mockListApprovals.mockReturnValue(new Promise(() => {}));
     mockListActivity.mockReturnValue(new Promise(() => {}));
     mockGetOverviewAttention.mockReturnValue(new Promise(() => {}));
@@ -51,7 +51,7 @@ describe('Overview page', () => {
 
   it('renders error state when initial API calls reject', async () => {
     mockHealth.mockRejectedValue(new Error('API server down'));
-    mockListAgents.mockResolvedValue({ agents: [] });
+    mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
     mockListApprovals.mockResolvedValue({ approvals: [] });
     mockListActivity.mockResolvedValue({ activity: [] });
 
@@ -72,7 +72,7 @@ describe('Overview page', () => {
       status: 'ok',
       signerAccountId: 'GD6WTESTACCOUNT1234567890',
     });
-    mockListAgents.mockResolvedValue({
+    mockListAllAgents.mockResolvedValue({
       agents: [
         {
           id: 'agent-1',
@@ -147,6 +147,8 @@ describe('Overview page', () => {
           updatedAt: '',
         },
       ],
+      total: 6,
+      truncated: false,
     });
     mockListApprovals.mockResolvedValue({
       approvals: [
@@ -197,7 +199,7 @@ describe('Overview page', () => {
 
   it('renders operational state when attention issues are zero', async () => {
     mockHealth.mockResolvedValue({ status: 'ok', signerAccountId: 'GD6WTEST1234' });
-    mockListAgents.mockResolvedValue({ agents: [] });
+    mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
     mockListApprovals.mockResolvedValue({ approvals: [] });
     mockListActivity.mockResolvedValue({ activity: [] });
     mockGetOverviewAttention.mockResolvedValue({
@@ -222,7 +224,7 @@ describe('Overview page', () => {
 
   it('renders attention table when there are attention issues', async () => {
     mockHealth.mockResolvedValue({ status: 'ok', signerAccountId: 'GD6WTEST1234' });
-    mockListAgents.mockResolvedValue({ agents: [] });
+    mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
     mockListApprovals.mockResolvedValue({ approvals: [] });
     mockListActivity.mockResolvedValue({ activity: [] });
     mockGetOverviewAttention.mockResolvedValue({
@@ -261,7 +263,7 @@ describe('Overview page', () => {
 
   it('renders attention error banner if getOverviewAttention rejects', async () => {
     mockHealth.mockResolvedValue({ status: 'ok', signerAccountId: 'GD6WTEST1234' });
-    mockListAgents.mockResolvedValue({ agents: [] });
+    mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
     mockListApprovals.mockResolvedValue({ approvals: [] });
     mockListActivity.mockResolvedValue({ activity: [] });
     mockGetOverviewAttention.mockRejectedValue(new Error('Attention service failed'));
@@ -279,7 +281,7 @@ describe('Overview page', () => {
 
   it('renders recent activity table when activity records exist', async () => {
     mockHealth.mockResolvedValue({ status: 'ok', signerAccountId: 'GD6WTEST1234' });
-    mockListAgents.mockResolvedValue({ agents: [] });
+    mockListAllAgents.mockResolvedValue({ agents: [], total: 0, truncated: false });
     mockListApprovals.mockResolvedValue({ approvals: [] });
     mockListActivity.mockResolvedValue({
       activity: [

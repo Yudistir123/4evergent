@@ -604,6 +604,17 @@ code.copyable:hover { text-decoration: underline; }
   margin-bottom: var(--space-md);
 }
 
+/* Neutral notice (e.g. a list truncated at the pagination limit). */
+.notice-banner {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-hover);
+  color: var(--color-text);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-md);
+}
+
 .success-banner {
   background: var(--color-ok-bg);
   border: 1px solid rgba(0, 255, 136, 0.2);

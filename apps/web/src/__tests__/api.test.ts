@@ -203,6 +203,86 @@ describe('ApiError code', () => {
   });
 });
 
+describe('api.listAgents pagination (#380)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    sessionStorage.clear();
+  });
+
+  function mockPagedFetch(pages: Record<string, unknown>): void {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = String(input);
+      const body = pages[url];
+      if (body === undefined) throw new Error(`unexpected fetch URL: ${url}`);
+      return { status: 200, ok: true, json: async () => body } as unknown as Response;
+    });
+  }
+
+  const agent = (id: string) => ({
+    id,
+    displayName: id,
+    description: '',
+    ownerId: 'owner-1',
+    stellarAddress: '',
+    capabilities: [],
+    status: 'active',
+    active: true,
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+  });
+
+  it('listAgents() with no args requests /agents with no query string', async () => {
+    mockPagedFetch({ 'http://localhost:3000/agents': { agents: [], hasMore: false, truncated: false, total: 0 } });
+    const { api } = await import('../api');
+    const res = await api.listAgents();
+    expect(res).toEqual({ agents: [], hasMore: false, truncated: false, total: 0 });
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it('listAgents(limit, offset) forwards both as query params', async () => {
+    mockPagedFetch({
+      'http://localhost:3000/agents?limit=2&offset=4': { agents: [], hasMore: false, truncated: false, total: 0 },
+    });
+    const { api } = await import('../api');
+    await api.listAgents(2, 4);
+    const url = String(vi.mocked(globalThis.fetch).mock.calls[0]![0]);
+    expect(url).toBe('http://localhost:3000/agents?limit=2&offset=4');
+  });
+
+  it('listAllAgents pages through every page and returns all agents', async () => {
+    const first200 = Array.from({ length: 200 }, (_, i) => agent(`agent-${i}`));
+    mockPagedFetch({
+      'http://localhost:3000/agents?limit=200&offset=0': {
+        agents: first200, hasMore: true, truncated: true, total: 201,
+      },
+      'http://localhost:3000/agents?limit=200&offset=200': {
+        agents: [agent('agent-200')], hasMore: false, truncated: false, total: 201,
+      },
+    });
+    const { api } = await import('../api');
+    const res = await api.listAllAgents();
+    expect(res.agents).toHaveLength(201);
+    expect(res.agents[200]!.id).toBe('agent-200');
+    expect(res.total).toBe(201);
+    expect(res.truncated).toBe(false);
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it('listAllAgents reports truncated when the server stops paging early', async () => {
+    mockPagedFetch({
+      'http://localhost:3000/agents?limit=200&offset=0': {
+        agents: [agent('agent-0'), agent('agent-1')],
+        hasMore: false, truncated: true, total: 5,
+      },
+    });
+    const { api } = await import('../api');
+    const res = await api.listAllAgents();
+    expect(res.agents).toHaveLength(2);
+    expect(res.total).toBe(5);
+    expect(res.truncated).toBe(true);
+  });
+});
+
 describe('describeApiError', () => {
   it('maps a known code to a context-appropriate message', () => {
     const msg = describeApiError(new ApiError(404, 'Approval not found', 'APPROVAL_NOT_FOUND'), 'fallback');
