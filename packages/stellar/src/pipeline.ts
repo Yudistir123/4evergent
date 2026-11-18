@@ -111,6 +111,42 @@ export class TransactionPipeline {
     // once here. Never both.
     const decision = input.policyDecision ?? await this.policy.evaluate(intent, agentId);
 
+    // #371: terminal duplicate — a previous execution with this key already
+    // finished (submitted / rejected / failed / requires_approval). Replay
+    // its outcome instead of executing a second time. This is the safety net
+    // for direct pipeline callers and sequential replays that bypass the
+    // API handler; the API-level per-key lock is the guard for concurrent
+    // HTTP requests. A record found here is final: persist only ever
+    // happens with a terminal outcome, so a "pending" winner means an
+    // execution is still in flight — refuse to execute a second one.
+    // The duplicate's own reservation (if any) is released: the first
+    // execution already holds the single reservation for this intent.
+    if (idempotencyKey && !activityId && this.activityStore) {
+      const winner = await this.activityStore.getByIdempotencyKey(ownerId, agentId, idempotencyKey);
+      if (winner) {
+        await this.releaseReservation(agentId, decision);
+        if (JSON.stringify(winner.intent) !== JSON.stringify(intent)) {
+          return {
+            status: "rejected",
+            message: "Idempotency-Key conflict: key was already used with a different intent",
+            policyDecision: decision,
+            simulationResult: null,
+            activityId: winner.id,
+          };
+        }
+        if (winner.status === "pending") {
+          return {
+            status: "rejected",
+            message: "Idempotency-Key conflict: an execution with this key is still in flight",
+            policyDecision: decision,
+            simulationResult: null,
+            activityId: winner.id,
+          };
+        }
+        return this.outcomeFromRecord(winner);
+      }
+    }
+
     if (decision.result === "deny") {
       // Post-#353 the engine reserves only after every deny check, so a
       // deny normally carries no reservation. Release defensively anyway:
@@ -120,13 +156,13 @@ export class TransactionPipeline {
       activity.status = "rejected";
       activity.authorizationStatus = "denied_by_policy";
       activity.error = decision.reason;
-      await this.persistActivity(activity, idempotencyKey, activityId);
+      const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
       return {
         status: "rejected",
         message: `Policy denied: ${decision.reason}`,
         policyDecision: decision,
         simulationResult: null,
-        activityId: activity.id,
+        activityId: persisted.activityId,
       };
     }
 
@@ -135,16 +171,34 @@ export class TransactionPipeline {
         const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
         activity.status = "requires_approval";
         activity.authorizationStatus = "pending_approval";
+        // #371: persist FIRST so a duplicate (created=false) is detected
+        // before a second approval is minted for the same key.
+        const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
+        if (!persisted.created) {
+          // Duplicate: the first execution already owns this key and its
+          // approval. Release this call's reservation (the first holds the
+          // single one) and replay the first approval instead of minting
+          // a second.
+          await this.releaseReservation(agentId, decision);
+          const approvalId = await this.findApprovalIdForActivity(agentId, persisted.activityId);
+          return {
+            status: "requires_approval",
+            message: decision.reason,
+            policyDecision: decision,
+            simulationResult: null,
+            activityId: persisted.activityId,
+            approvalId,
+          };
+        }
         const expiresAt = new Date(Date.now() + this.approvalTtlSeconds * 1000).toISOString();
-        const approval = createApproval(activity.id, agentId, ownerId, intent, decision, expiresAt);
-        await this.persistActivity(activity, idempotencyKey, activityId);
+        const approval = createApproval(persisted.activityId, agentId, ownerId, intent, decision, expiresAt);
         await this.approvalStore.record(approval);
         return {
           status: "requires_approval",
           message: decision.reason,
           policyDecision: decision,
           simulationResult: null,
-          activityId: activity.id,
+          activityId: persisted.activityId,
           approvalId: approval.id,
         };
       }
@@ -177,13 +231,13 @@ export class TransactionPipeline {
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "rejected";
       activity.error = e.message;
-      await this.persistActivity(activity, idempotencyKey, activityId);
+      const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
       return {
         status: "rejected",
         message: `Transaction construction failed: ${e.message}`,
         policyDecision: decision,
         simulationResult: null,
-        activityId: activity.id,
+        activityId: persisted.activityId,
       };
     }
 
@@ -198,13 +252,13 @@ export class TransactionPipeline {
       activity.status = "failed";
       activity.authorizationStatus = "denied_by_simulation";
       activity.error = simResult.error ?? "Simulation failed";
-      await this.persistActivity(activity, idempotencyKey, activityId);
+      const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
       return {
         status: "simulation_failed",
         message: simResult.error ?? "Simulation failed",
         policyDecision: decision,
         simulationResult: simResult,
-        activityId: activity.id,
+        activityId: persisted.activityId,
       };
     }
 
@@ -223,13 +277,13 @@ export class TransactionPipeline {
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "failed";
       activity.error = e.message;
-      await this.persistActivity(activity, idempotencyKey, activityId);
+      const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
       return {
         status: "rejected",
         message: `Signing failed: ${e.message}`,
         policyDecision: decision,
         simulationResult: simResult,
-        activityId: activity.id,
+        activityId: persisted.activityId,
       };
     }
 
@@ -249,15 +303,18 @@ export class TransactionPipeline {
       activity.authorizationStatus = "approved";
       activity.txHash = result.hash;
       activity.simulationResult = simResult;
-      await this.persistActivity(activity, idempotencyKey, activityId);
+      const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
+      // #371: on a duplicate the winner's txHash wins — never overwrite
+      // the first execution's hash with this call's.
+      const txHash = persisted.existing?.txHash ?? result.hash;
       return {
         status: "submitted",
-        message: `Transaction submitted: ${result.hash}`,
+        message: `Transaction submitted: ${txHash}`,
         policyDecision: decision,
         simulationResult: simResult,
-        txHash: result.hash,
-        activityId: activity.id,
-        submittedHash: result.hash,
+        txHash,
+        activityId: persisted.activityId,
+        submittedHash: txHash,
       };
     } catch (e: any) {
       if (signal?.aborted || e?.name === "AbortError") {
@@ -272,14 +329,14 @@ export class TransactionPipeline {
       activity.error = e.message;
       activity.txHash = preSubmitHash;
       activity.simulationResult = simResult;
-      await this.persistActivity(activity, idempotencyKey, activityId);
+      const persisted = await this.persistActivity(activity, idempotencyKey, activityId);
       return {
         status: "rejected",
         message: `Submission failed: ${e.message}`,
         policyDecision: decision,
         simulationResult: simResult,
-        txHash: preSubmitHash,
-        activityId: activity.id,
+        txHash: persisted.existing?.txHash ?? preSubmitHash,
+        activityId: persisted.activityId,
       };
     }
   }
@@ -546,12 +603,93 @@ export class TransactionPipeline {
     await this.releaseReservation(approval.agentId, approval.policyDecision);
   }
 
+  /**
+   * Replays the outcome of a previous terminal execution for the same
+   * Idempotency-Key (#371). Used by the duplicate pre-check in execute():
+   * a replay must return exactly what the first execution returned, never
+   * re-execute and never mint a second approval.
+   */
+  private async outcomeFromRecord(winner: ActivityRecord): Promise<PipelineOutcome> {
+    const fallbackSim = { success: true, fee: "100", operations: 1, warnings: [] };
+    switch (winner.status) {
+      case "submitted":
+        return {
+          status: "submitted",
+          message: `Transaction submitted: ${winner.txHash ?? "unknown"}`,
+          policyDecision: winner.policyDecision,
+          simulationResult: (winner.simulationResult ?? fallbackSim) as SimulationLike,
+          txHash: winner.txHash ?? "",
+          activityId: winner.id,
+          submittedHash: winner.txHash ?? undefined,
+        };
+      case "requires_approval": {
+        const approvalId = await this.findApprovalIdForActivity(winner.agentId, winner.id);
+        return {
+          status: "requires_approval",
+          message: winner.policyDecision.reason,
+          policyDecision: winner.policyDecision,
+          simulationResult: null,
+          activityId: winner.id,
+          approvalId,
+        };
+      }
+      case "failed":
+        if (winner.authorizationStatus === "denied_by_simulation") {
+          return {
+            status: "simulation_failed",
+            message: winner.error ?? "Simulation failed",
+            policyDecision: winner.policyDecision,
+            simulationResult: (winner.simulationResult ?? fallbackSim) as SimulationLike,
+            activityId: winner.id,
+          };
+        }
+        return {
+          status: "rejected",
+          message: winner.error ?? "Execution failed",
+          policyDecision: winner.policyDecision,
+          simulationResult: winner.simulationResult as SimulationLike | null,
+          txHash: winner.txHash,
+          activityId: winner.id,
+        };
+      default:
+        return {
+          status: "rejected",
+          message: winner.error ?? winner.policyDecision.reason,
+          policyDecision: winner.policyDecision,
+          simulationResult: winner.simulationResult as SimulationLike | null,
+          txHash: winner.txHash,
+          activityId: winner.id,
+        };
+    }
+  }
+
+  /** Finds the pending approval minted for an activity, if one exists. */
+  private async findApprovalIdForActivity(agentId: string, activityId: string): Promise<string | undefined> {
+    if (!this.approvalStore) return undefined;
+    try {
+      const pending = await this.approvalStore.listByAgent(agentId, 50, 0, "pending_approval");
+      return pending.find((a) => a.activityId === activityId)?.id;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Persists an outcome activity record and reports which record actually
+   * owns the Idempotency-Key.
+   *
+   * #371: when `recordIdempotent` reports `created: false`, ANOTHER
+   * execution already owns this key — the duplicate MUST NOT merge its
+   * state into the winner. In particular the winner's `txHash` (the first
+   * execution's on-chain transaction) is never overwritten. Callers use
+   * the returned `activityId` (the winner's) in their outcome.
+   */
   private async persistActivity(
     record: ActivityRecord,
     idempotencyKey?: string | null,
     existingActivityId?: string
-  ): Promise<void> {
-    if (!this.activityStore) return;
+  ): Promise<{ activityId: string; created: boolean; existing?: ActivityRecord }> {
+    if (!this.activityStore) return { activityId: record.id, created: true };
 
     // Schedule-driven path: update the pre-existing activity record
     // created by the scheduler callback instead of creating a duplicate.
@@ -563,24 +701,19 @@ export class TransactionPipeline {
         txHash: record.txHash,
         simulationResult: record.simulationResult,
       });
-      return;
+      return { activityId: existingActivityId, created: true };
     }
 
     if (idempotencyKey) {
       const result = await this.activityStore.recordIdempotent(idempotencyKey, record);
       if (!result.created) {
-        // Another request already reserved this key — merge the new state into existing
-        await this.activityStore.update(result.record.id, {
-          status: record.status,
-          authorizationStatus: record.authorizationStatus,
-          error: record.error,
-          txHash: record.txHash,
-          simulationResult: record.simulationResult,
-        });
+        // Duplicate — return the winner untouched; no merge, no overwrite.
+        return { activityId: result.record.id, created: false, existing: result.record };
       }
-    } else {
-      await this.activityStore.record(record);
+      return { activityId: record.id, created: true };
     }
+    await this.activityStore.record(record);
+    return { activityId: record.id, created: true };
   }
 
   /**

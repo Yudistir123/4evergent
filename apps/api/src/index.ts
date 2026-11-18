@@ -264,6 +264,44 @@ export async function createApiServer(options: ServerOptions) {
       // Best-effort bookkeeping; the stale row is swept at the day boundary.
     }
   }
+
+  /**
+   * Per-key in-flight lock (#371). Serializes intent handling per
+   * (owner, agent, Idempotency-Key) for the whole request duration.
+   *
+   * WHY A LOCK, NOT AN EARLY PENDING RECORD: recording a pending activity
+   * before policy evaluation would need a placeholder decision (the real
+   * one does not exist yet), and that placeholder would leak into the
+   * activity log if evaluation then denied. The lock instead makes the
+   * second concurrent request wait, then hit the pre-check in
+   * handleIntentExecute and replay the first request's record — so it
+   * never evaluates policy and never reserves daily spending a second
+   * time, composing cleanly with #353's single-reservation rule.
+   *
+   * SCOPE: one server process. Requests without a key bypass the lock
+   * entirely. Cross-process duplicates (two server instances sharing one
+   * SQLite file) still rely on the store-level `recordIdempotent` atomic
+   * reservation plus the pipeline's no-overwrite rule (#371 defense in
+   * depth); the lock is the guard for the single-process deployment this
+   * server runs as.
+   */
+  const idempotencyLocks = new Map<string, Promise<void>>();
+  async function withIdempotencyKeyLock<T>(scopeKey: string, fn: () => Promise<T>): Promise<T> {
+    const prev = idempotencyLocks.get(scopeKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = prev.then(() => current);
+    idempotencyLocks.set(scopeKey, chained);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (idempotencyLocks.get(scopeKey) === chained) idempotencyLocks.delete(scopeKey);
+    }
+  }
   const adapter = new StellarAdapter(options.horizonUrl);
 
   const readinessTimeoutMs = options.readiness?.timeoutMs ?? 2_000;
@@ -1626,6 +1664,23 @@ export async function createApiServer(options: ServerOptions) {
       if (idempotencyKey.length > 256) {
         return apiError(res, "IDEMPOTENCY_KEY_INVALID");
       }
+    }
+
+    // #371: serialize per (owner, agent, key) for the whole request. A
+    // concurrent duplicate waits here, then the pre-check inside
+    // handleIntentExecute replays the first request's record instead of
+    // evaluating policy and executing a second time. Keyless requests
+    // bypass the lock entirely.
+    if (!idempotencyKey) {
+      return handleIntentExecute(ctx, req, res, agentId, intent, null);
+    }
+    return withIdempotencyKeyLock(`${ctx.ownerId}:${agentId}:${idempotencyKey}`, () =>
+      handleIntentExecute(ctx, req, res, agentId, intent, idempotencyKey)
+    );
+  }
+
+  async function handleIntentExecute(ctx: RequestContext, req: any, res: any, agentId: string, intent: AgentIntent, idempotencyKey: string | null) {
+    if (idempotencyKey) {
       const existing = await store.getByIdempotencyKey(ctx.ownerId!, agentId, idempotencyKey);
       if (existing) {
         // Same key + different intent → conflict
